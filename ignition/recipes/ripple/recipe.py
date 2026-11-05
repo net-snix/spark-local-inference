@@ -88,10 +88,10 @@ RECIPE = Recipe(
         revision="240d5966cbe00f0627c699e59ef58560b60303cf", architecture="RicursiveForCausalLM",
         stored_bytes=_BF16_BYTES, device_bytes=_BF16_BYTES + 2 * _EMBEDDING_BYTES + _DRAFT_BYTES,
         decode_weight_bytes=_BF16_BYTES, draft_bytes=_DRAFT_BYTES + _EMBEDDING_BYTES),
-        # A local GPTQ MXFP8 build of the same checkpoint that fits one 96 GB GPU; see
+        # A GPTQ MXFP8 build of the same checkpoint that fits one 96 GB GPU; see
         # docs/model-preparation.md for how it is made and its measured KL divergence.
-        Checkpoint(alias="ripple-65b-mxfp8", repository="/data/models/Ripple-65B-Preview-MXFP8-GPTQ",
-        revision="local", architecture="RicursiveForCausalLM",
+        Checkpoint(alias="ripple-65b-mxfp8", repository="notSnix/Ripple-65B-Preview-MXFP8-GPTQ",
+        revision="bfea8efd56c3df0e8b44b028e65ea83aec05753c", architecture="RicursiveForCausalLM",
         stored_bytes=_MXFP8_BYTES, device_bytes=_MXFP8_BYTES + 2 * _EMBEDDING_BYTES + _DRAFT_BYTES,
         decode_weight_bytes=_MXFP8_BYTES, draft_bytes=_DRAFT_BYTES + _EMBEDDING_BYTES,
         expansion_bytes=_MXFP8_SCALE_BYTES)),

@@ -1131,7 +1131,7 @@ while loading. It halves decode weight traffic and, on two RTX PRO 6000 GPUs,
 raises the KV budget to about 345,000 tokens, enough for one full-context
 request. MXFP8 changes the checkpoint arithmetic, so BF16 remains the default.
 
-`ripple-65b-mxfp8` serves `/data/models/Ripple-65B-Preview-MXFP8-GPTQ`, a ModelOpt
+`ripple-65b-mxfp8` serves [`notSnix/Ripple-65B-Preview-MXFP8-GPTQ`](https://huggingface.co/notSnix/Ripple-65B-Preview-MXFP8-GPTQ), a ModelOpt
 `MIXED_PRECISION` checkpoint that stores all 640 decoder projections as MXFP8
 (`F8_E4M3` `weight` plus `U8` UE8M0 `weight_scale` per 32 inputs) and keeps the
 embedding, vocabulary head, norms and value-residual weights in BF16: 67.8 GB of
@@ -1140,10 +1140,10 @@ declaration, checks every stored shape, and loads the payloads unchanged. Those
 projections run weight-only (BF16 activations, `a16`), which is the arithmetic of
 the dequantized checkpoint. The weights come from sequential GPTQ inside the MXFP8
 grid (scale `2^ceil(log2(amax/448))` per 32, the same grid `--online-mxfp8` uses)
-on 128 Nemotron calibration sequences. Against BF16 on 120 held-out 2,048-token
-sequences (teacher-forced, full-vocabulary KL(BF16 || MXFP8)), mean KL is 0.00266
-(95% CI 0.00216-0.00320) with 98.82% top-1 agreement. Round-to-nearest MXFP8 scores
-0.00614 and 98.19%. The checkpoint's README and `quantization/` directory record the
+on 180 Nemotron calibration sequences, 12 from each of 15 domains. Against BF16
+on 120 held-out 2,048-token sequences (teacher-forced, full-vocabulary
+KL(BF16 || MXFP8)), mean KL is 0.00275 (95% CI 0.00218-0.00343) with 98.76% top-1
+agreement. Round-to-nearest MXFP8 scores 0.00614 and 98.19%. The checkpoint's README and `quantization/` directory record the
 data, scripts and per-sequence results. On one GPU, `--online-mxfp8` converts only
 the BF16 draft, and 2,048-token prefill chunks keep kernel tuning within memory:
 weight-only split-K candidates for the 4,096-row gate/up projection reserve 20 GiB
@@ -1154,9 +1154,9 @@ of scratch, more than one 96 GB GPU has left after the weights.
 flare run PACKAGE --gpus 0
 ```
 
-On one RTX PRO 6000 that leaves about 68,000 KV tokens (about 50,000 per request).
-Weight-only GEMMs keep decode near the two-GPU BF16 package, but prefill runs at
-about 1,000 tokens per second. Prefill stays weight-only on purpose: quantizing
+On one RTX PRO 6000 that leaves 68,608 KV tokens (49,792 per request).
+Weight-only GEMMs keep decode near the two-GPU BF16 package (76 tokens per second
+mean single stream with DFlash2), but prefill runs at about 1,050 tokens per second. Prefill stays weight-only on purpose: quantizing
 the prompt positions' activations to MXFP8 as well raised the KL of the 1,024
 tokens decoded after a 1,024-token prompt from 0.00317 to 0.00486 (worse on 111
 of 120 test sequences), and MXFP8 activations everywhere reach 0.00875.

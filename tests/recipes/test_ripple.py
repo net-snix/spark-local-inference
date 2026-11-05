@@ -446,7 +446,7 @@ def test_two_rtx_pro_6000_plan_fits(drafting):
 
 # MXFP8 checkpoint: ModelOpt MIXED_PRECISION with every decoder projection, and only those, as MXFP8.
 
-MXFP8_DIRECTORY = "/data/models/Ripple-65B-Preview-MXFP8-GPTQ"
+MXFP8_DIRECTORY = "/data/models/Ripple-65B-Preview-MXFP8-GPTQ"  # a local copy of the pinned revision
 
 
 def mxfp8_config():
@@ -574,7 +574,8 @@ def test_mxfp8_scale_dtype_mismatch_rejected(monkeypatch):
 
 def test_mxfp8_checkpoint_declaration():
     checkpoint = mxfp8_checkpoint()
-    assert (checkpoint.repository, checkpoint.revision) == (MXFP8_DIRECTORY, "local")
+    assert checkpoint.repository == "notSnix/Ripple-65B-Preview-MXFP8-GPTQ"
+    assert len(checkpoint.revision) == 40 and int(checkpoint.revision, 16) >= 0
     # One E4M3 byte plus one UE8M0 scale byte per 32 inputs for every decoder projection; the
     # embedding, vocabulary head, norms and value-residual weights stay BF16.
     projections = 80 * (2 * 10240 * 5120 + 2 * 1024 * 5120 + 5120 * 10240 + 3 * 40960 * 5120)
