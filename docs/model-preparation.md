@@ -1086,6 +1086,50 @@ the canonical control-sequence escaping.
 flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --gpus 0,1,2,3,4,5,6,7
 ```
 
+## Ripple 65B Preview
+
+`ripple-65b` prepares `ricursiveAI/Ripple-65B-Preview` for BF16 text generation
+across two or four GPUs of the same architecture. The dense decoder has 80
+layers: four of every five use 1,024-token sliding-window attention with rotary
+positions, and every fifth layer is global attention without positions. Each
+layer applies normalization before and after attention and the MLP, a sigmoid
+attention output gate, a first-layer value residual blended into later layers,
+the clamped FFN activation, and the checkpoint's embedding scale. Attention and
+MLP projections shard across ranks; the vocabulary head is sharded and the BF16
+embedding is replicated on every rank. KV pages are BF16 and reside in device
+memory.
+
+The pinned BF16 `ricursiveAI/Ripple-65B-Preview-DFlash2` draft is fetched into the
+Hub cache with the target. It consumes residual features from target layers 1,
+20, 39, 58, and 77, shares the target embedding and vocabulary head, and proposes
+sixteen-token blocks with a four-tap grouped convolution. Its first four layers
+use 4,096-token sliding attention; its last layer is declared full attention
+without positions. All five layers read 4,096-token FP8 rings of accepted target
+context per continuation, so the full-attention layer sees exact context through
+4,096 tokens and the most recent 4,096 tokens beyond that. This bounds proposal
+acceptance on long contexts only; verification always uses the target's full
+KV. Speculation defaults to fifteen draft tokens with adaptive packed
+verification capped at 64 target rows and a 24-graph budget.
+
+Tool calls use the Hermes `<tool_call>` JSON envelope from the checkpoint chat
+template. Prepare on the same GPU architecture as the serving devices:
+
+```sh
+.venv/bin/ignition export ripple-65b --gpus 0,1
+flare run PACKAGE --gpus 0,1
+```
+
+The recipe context capacity is 262144 tokens, but BF16 weights leave room for
+roughly 150,000 KV tokens across all requests on two 96 GB GPUs. A runtime
+request is limited to the KV pages actually allocated, after the draft rings are
+reserved. The recipe is validated with tensor parallelism two on RTX PRO 6000
+Blackwell GPUs. `--no-mtp` skips the draft download and omits its weights,
+rings, and speculative graphs.
+`--online-mxfp8` converts target and draft attention and MLP projections to MXFP8
+while loading. It halves decode weight traffic and, on two RTX PRO 6000 GPUs,
+raises the KV budget to about 345,000 tokens, enough for one full-context
+request. MXFP8 changes the checkpoint arithmetic, so BF16 remains the default.
+
 ## Storage and graph capacities
 
 Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative

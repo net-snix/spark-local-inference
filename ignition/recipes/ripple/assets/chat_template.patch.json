@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "ricursiveAI/Ripple-65B-Preview",
+    "revision": "240d5966cbe00f0627c699e59ef58560b60303cf",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "877c2dbf365243dda14738ca250b31398059b35ffd91d4ed0ec68be45ca6ebd3",
+  "result_sha256": "e99c15219b2d0a97f1d894f6076b03a368ae8feb935e76462d5cded1513daa91",
+  "insertions": [
+    948,
+    2556
+  ]
+}

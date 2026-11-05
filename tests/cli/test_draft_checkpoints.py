@@ -15,7 +15,7 @@ from ignition.cli.preparation import Host, derive
 from ignition.recipes import ResolvedModel, recipes
 
 
-@pytest.mark.parametrize("name,embedded", [("nemotron_h", False), ("kimi3", False), ("kimi3", True), ("muse_spark", False), ("qwen38_dense", False)])
+@pytest.mark.parametrize("name,embedded", [("nemotron_h", False), ("kimi3", False), ("kimi3", True), ("muse_spark", False), ("qwen38_dense", False), ("ripple", False)])
 @pytest.mark.parametrize("custom_cache", [False, True])
 @pytest.mark.parametrize("drafting", [False, True])
 def test_draft_preparation_selects_local_or_hub_snapshot(monkeypatch, tmp_path, name, custom_cache, drafting, embedded):
@@ -51,7 +51,8 @@ def test_draft_preparation_selects_local_or_hub_snapshot(monkeypatch, tmp_path, 
     def cached_download(repository, **options):
         downloads.append(repository)
         assert options["allow_patterns"] == ("config.json", "model.safetensors")
-        return download(repository, **options, local_files_only=True)
+        # Ripple forwards the hub's offline setting itself; this reader always stays offline.
+        return download(repository, **(options | {"local_files_only": True}))
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", cached_download)
 
@@ -70,8 +71,8 @@ def test_draft_preparation_selects_local_or_hub_snapshot(monkeypatch, tmp_path, 
         snapshot = target / "dspark"
         snapshot.mkdir(parents=True)
     config = recipe.prepare(target, plan, compile_forwards=True, kernel_cache=None, progress=None)
-    if name in ("muse_spark", "qwen38_dense"):
-        if name == "qwen38_dense":
+    if name in ("muse_spark", "qwen38_dense", "ripple"):
+        if name in ("qwen38_dense", "ripple"):
             assert config.mtp is drafting
         else:
             assert config.dflash is drafting
@@ -79,8 +80,8 @@ def test_draft_preparation_selects_local_or_hub_snapshot(monkeypatch, tmp_path, 
         if drafting:
             assert config.speculative_widths == plan.speculation.widths
             assert config.speculative_fixed_width == plan.speculation.fixed_width
-            assert config.speculative_token_capacity == (128 if name == "qwen38_dense" else 32)
-            assert config.speculative_graph_budget == 64
+            assert config.speculative_token_capacity == {"qwen38_dense": 128, "ripple": 64}.get(name, 32)
+            assert config.speculative_graph_budget == (24 if name == "ripple" else 64)
     else:
         assert config.draft_checkpoint == (str(snapshot) if drafting else None)
     assert downloads == ([repository] if drafting and not embedded else [])

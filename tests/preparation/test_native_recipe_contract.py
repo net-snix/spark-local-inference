@@ -28,12 +28,13 @@ from ignition.preparation.execution import GraphSignature, PreparedExecution
 
 RECIPES = (
     "deepseek41", "deepseek4", "qwen38", "qwen38_dense", "glm53", "mimo_v2",
-    "kimi3", "minimax_m3", "nemotron_h", "step5", "gemma4",
+    "kimi3", "minimax_m3", "nemotron_h", "step5", "gemma4", "ripple",
 )
+TEXT_ONLY = ("gemma4", "qwen38_dense", "ripple")
 
 
 def _vision_buffers(recipe):
-    if recipe in ("gemma4", "qwen38_dense"):
+    if recipe in TEXT_ONLY:
         return {}
     if recipe in ("deepseek4", "deepseek41"):
         from ignition.components.deepseek_vision import VisionInputs
@@ -60,6 +61,9 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
     fields = bootstrap.PreparationConfig.__dataclass_fields__
     if recipe == "qwen38_dense":
         options.update(draft_snapshot=Path("metadata-draft"), max_active=32)
+    if recipe == "ripple":
+        options.update(mtp=True, draft_snapshot=Path("metadata-draft"), speculative_widths=tuple(range(1, 17)),
+                       speculative_token_capacity=64, speculative_graph_budget=24)
     if recipe in ("qwen38", "glm53"):
         options["mtp"] = True
     if recipe == "qwen38":
@@ -87,7 +91,10 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
         frame_index=torch.zeros(1, dtype=torch.int32),
         submission_sequence=torch.zeros(1, dtype=torch.int64),
         draft_page_tables=torch.zeros_like(inputs.page_tables))
-    completion_capacity = config.completion_token_capacity if completion_capacity is None else completion_capacity
+    if completion_capacity is None:
+        # Ripple sizes its completion vectors by its widest verification round.
+        completion_capacity = (config.verification_width if recipe == "ripple"
+                               else config.completion_token_capacity)
     buffers.update(CompletionOutputs.allocate((2, capacity, 16 + completion_capacity), device="cpu").buffers())
     vision_buffers = _vision_buffers(recipe)
     buffers.update(vision_buffers)
@@ -165,7 +172,7 @@ def _recipe_metadata(recipe, *, all_variants=True, config_options=None, completi
         kwargs["draft_lag"] = None
     if "frontend" in arguments:
         kwargs["frontend"] = importlib.import_module(f"ignition.recipes.{recipe}.frontend").FRONTEND
-    if recipe not in ("gemma4", "qwen38_dense"):
+    if recipe not in TEXT_ONLY:
         add("vision", 1, 1)
     contract = module.prepare(signatures, buffers, pool, **kwargs)
     if contract["vision"]["max_images"]:
@@ -254,6 +261,21 @@ def test_qwen_dense_packed_catalog_and_zero_lag_cursor_pass_native_contract_vali
     assert config.speculative_token_capacity == 128
     assert all(graph["draft_cursor"]["lag_tokens"] == 0
         for graph in contract["graphs"] if graph["kind"] == p.SPECULATIVE)
+
+
+def test_ripple_packed_dflash2_catalog_passes_native_contract_validation():
+    import flare_heliopause
+    from ignition.preparation import runtime_package_pb2 as p
+
+    config, contract, manifest = _recipe_metadata("ripple")
+    flare_heliopause.validate_prepared_contract(manifest, json.dumps(contract))
+    assert config.verification_width == 16 and manifest["completion_token_capacity"] == 16
+    speculative = {(graph["batch_capacity"], graph["token_capacity"], graph.get("packed_token_capacity", 0))
+                   for graph in manifest["graphs"] if graph["kind"] == "speculative"}
+    assert (4, 16, 64) in speculative and {(1, 1, 1), (2, 1, 2), (4, 1, 4)} <= speculative
+    assert all(graph["draft_cursor"]["lag_tokens"] == 0
+        for graph in contract["graphs"] if graph["kind"] == p.SPECULATIVE)
+    assert contract["frontend"]["tools"]["kind"] == p.HERMES_JSON
 
 
 @pytest.mark.parametrize("tokens", [8, 13, 16, 32])

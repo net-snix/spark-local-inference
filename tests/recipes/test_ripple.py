@@ -1,0 +1,443 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Ripple-65B Preview configuration, tensor-parallel geometry, storage costs, and DFlash2 draft."""
+
+import copy
+from dataclasses import replace
+import json
+import os
+from pathlib import Path
+
+import pytest
+import torch
+
+from ignition.components.parallel import TensorParallelShard
+from ignition.recipes import resolve
+
+HUB = Path.home() / ".cache/huggingface/hub"
+MODEL = resolve("ripple-65b")
+LAYER_TYPES = ["full_attention" if index % 5 == 4 else "sliding_attention" for index in range(80)]
+CONFIG = {
+    "architectures": ["RicursiveForCausalLM"],
+    "auto_map": {"AutoConfig": "configuration_ricursive.RicursiveConfig",
+                 "AutoModel": "modeling_ricursive.RicursiveModel",
+                 "AutoModelForCausalLM": "modeling_ricursive.RicursiveForCausalLM"},
+    "bos_token_id": 100257, "embed_scale": 71.55417527999327,
+    "eos_token_id": [100265, 100257], "ffn_clamp_threshold": 20.0, "gate_full_precision": True,
+    "head_dim": 128, "hidden_act": "silu", "hidden_size": 5120,
+    "hybrid_layer_pattern": [0 if index % 5 == 4 else 1 for index in range(80)], "intermediate_size": 40960,
+    "is_hybrid_swa": True, "layer_types": LAYER_TYPES, "max_position_embeddings": 2097152,
+    "model_type": "ricursive", "num_attention_heads": 80, "num_hidden_layers": 80, "num_key_value_heads": 8,
+    "pad_token_id": 100277, "rms_norm_eps": 1e-06, "rope_theta": 10000.0, "sliding_window": 1024,
+    "tie_word_embeddings": False, "transformers_version": "4.57.6", "use_cache": True,
+    "use_gated_attention": True, "use_valres": True, "vocab_size": 100352,
+}
+DRAFT_CONFIG = {
+    "architectures": ["DFlash2DraftModel"], "attention_bias": False, "attention_dropout": 0.0,
+    "bos_token_id": 100257,
+    "dflash_config": {"block_size": 16, "conv_group_size": 16, "conv_kernel_size": 4, "mask_token_id": 100278,
+                      "selector_rank": 256, "selector_top_k": 32, "target_layer_ids": [1, 20, 39, 58, 77]},
+    "draft_vocab_size": 100352, "dtype": "bfloat16", "eos_token_id": [100265, 100257], "head_dim": 128,
+    "hidden_act": "silu", "hidden_size": 5120, "initializer_range": 0.02, "intermediate_size": 40960,
+    "is_causal": False, "layer_types": ["sliding_attention"] * 4 + ["full_attention"],
+    "max_position_embeddings": 131072, "max_window_layers": 5, "model_type": "qwen3", "no_rope_layers": [4],
+    "num_attention_heads": 80, "num_hidden_layers": 5, "num_key_value_heads": 8, "num_target_layers": 80,
+    "pad_token_id": 100277, "rms_norm_eps": 1e-06,
+    "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}, "rope_theta": 10000.0,
+    "sliding_window": 4096, "tie_word_embeddings": False, "transformers_version": "5.12.1", "use_cache": True,
+    "use_sliding_window": True, "vocab_size": 100352,
+}
+
+
+def checkpoint_snapshot(variable, repository, revision, required):
+    """A local checkpoint directory from the environment, else the pinned hub-cache snapshot."""
+    candidates = [Path(os.environ[variable])] if os.environ.get(variable) else []
+    candidates.append(HUB / f"models--{repository.replace('/', '--')}" / "snapshots" / revision)
+    for path in candidates:
+        if all((path / name).is_file() for name in required):
+            return path
+    pytest.skip(f"set {variable} or cache {repository}@{revision[:8]} ({', '.join(required)})")
+
+
+def target_snapshot(*required):
+    checkpoint = MODEL.checkpoint
+    return checkpoint_snapshot("FLARE_RIPPLE_CHECKPOINT", checkpoint.repository, checkpoint.revision,
+                               required or ("config.json",))
+
+
+def draft_snapshot(*required):
+    from ignition.recipes.ripple.draft_config import REPOSITORY, REVISION
+
+    return checkpoint_snapshot("FLARE_RIPPLE_DRAFT_CHECKPOINT", REPOSITORY, REVISION, required or ("config.json",))
+
+
+@pytest.fixture
+def target():
+    from ignition.recipes.ripple.config import ModelConfig
+
+    return ModelConfig.from_dict(copy.deepcopy(CONFIG))
+
+
+@pytest.fixture
+def drafted(target):
+    from ignition.recipes.ripple import draft_config
+
+    draft = draft_config.DFlash2Config.from_dict(copy.deepcopy(DRAFT_CONFIG), target_hidden=target.hidden,
+        target_vocabulary=target.vocabulary, target_layers=target.num_layers, expected=draft_config.PROFILE)
+    return replace(target, draft=draft)
+
+
+def test_checkpoint_configs_match_the_pinned_profiles():
+    assert json.loads((target_snapshot() / "config.json").read_text()) == CONFIG
+    assert json.loads((draft_snapshot() / "config.json").read_text()) == DRAFT_CONFIG
+
+
+def test_real_config_parses_into_the_declared_geometry():
+    from ignition.recipes.ripple.config import ModelConfig
+
+    config = ModelConfig.load(target_snapshot())
+    assert (config.num_layers, config.hidden, config.heads, config.kv_heads, config.head_dim) == (80, 5120, 80, 8, 128)
+    assert (config.intermediate_size, config.vocabulary, config.sliding_window) == (40960, 100352, 1024)
+    assert config.embed_scale == pytest.approx(5120 ** .5) and config.clamp == 20.
+    assert config.rms_norm_eps == 1e-6
+    assert [config.is_sliding(index) for index in range(80)] == [index % 5 != 4 for index in range(80)]
+    inverse = config.rotary_inverse("cpu")
+    assert inverse.shape == (64,) and inverse[0] == 1. and inverse[-1] == pytest.approx(10000. ** (-126 / 128))
+
+
+def test_optional_scale_and_clamp(target):
+    from ignition.recipes.ripple.config import ModelConfig
+
+    raw = copy.deepcopy(CONFIG)
+    del raw["embed_scale"], raw["ffn_clamp_threshold"]
+    config = ModelConfig.from_dict(raw)
+    assert config.embed_scale is None and config.clamp is None
+    raw["ffn_clamp_threshold"] = 0
+    assert ModelConfig.from_dict(raw).clamp is None
+    assert target.clamp == 20.
+
+
+@pytest.mark.parametrize("key,value", [
+    ("architectures", ["Olmo3ForCausalLM"]), ("architectures", None),
+    ("quantization_config", {"quant_method": "modelopt", "quant_algo": "NVFP4"}),
+    ("model_type", "olmo3"), ("hidden_act", "gelu"), ("head_dim", 256),
+    ("use_gated_attention", False), ("gate_full_precision", False), ("use_valres", False),
+    ("tie_word_embeddings", True), ("hidden_size", 0), ("hidden_size", 5120.), ("vocab_size", True),
+    ("num_hidden_layers", 79), ("num_key_value_heads", 7), ("sliding_window", -1),
+    ("max_position_embeddings", None), ("layer_types", LAYER_TYPES[:-1]),
+    ("layer_types", LAYER_TYPES[:-1] + ["linear_attention"]), ("layer_types", tuple(LAYER_TYPES)),
+    ("rope_theta", 0.), ("rms_norm_eps", -1e-6), ("embed_scale", 0.), ("ffn_clamp_threshold", -1.),
+])
+def test_unsupported_checkpoints_rejected(key, value):
+    from ignition.recipes.ripple.config import ModelConfig
+
+    raw = copy.deepcopy(CONFIG)
+    raw[key] = value
+    with pytest.raises(ValueError):
+        ModelConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize("key", ["model_type", "use_gated_attention", "gate_full_precision", "use_valres",
+                                 "hidden_size", "layer_types", "rope_theta", "rms_norm_eps"])
+def test_missing_required_fields_rejected(key):
+    from ignition.recipes.ripple.config import ModelConfig
+
+    raw = copy.deepcopy(CONFIG)
+    del raw[key]
+    with pytest.raises(ValueError):
+        ModelConfig.from_dict(raw)
+
+
+@pytest.mark.parametrize("world,q,kv,intermediate,vocabulary", [
+    (2, 5120, 512, 20480, 50176),
+    (4, 2560, 256, 10240, 25088),
+])
+def test_tensor_parallel_partitions(target, world, q, kv, intermediate, vocabulary):
+    ranges = []
+    for rank in range(world):
+        shard = TensorParallelShard(rank, world)
+        target.validate_shard(shard)
+        assert target.local_heads(shard) == 80 // world and target.local_kv_heads(shard) == 8 // world
+        ranges.append((target.q_range(shard), target.kv_range(shard), target.intermediate_range(shard),
+                       target.vocabulary_partition(shard)))
+    assert [r[0] for r in ranges] == [(rank * q, (rank + 1) * q) for rank in range(world)]
+    assert [r[1] for r in ranges] == [(rank * kv, (rank + 1) * kv) for rank in range(world)]
+    assert [r[2] for r in ranges] == [(rank * intermediate, (rank + 1) * intermediate) for rank in range(world)]
+    assert [r[3] for r in ranges] == [(rank * vocabulary, (rank + 1) * vocabulary, vocabulary)
+                                      for rank in range(world)]
+    # Every query-head slice holds whole heads, and its key/value heads cover the same GQA groups.
+    assert q % 128 == 0 and kv % 128 == 0 and (q // 128) // (kv // 128) == 10
+    assert ranges[-1][3][1] == target.vocabulary and ranges[-1][2][1] == target.intermediate_size
+
+
+@pytest.mark.parametrize("world", [3, 8])
+def test_unsupported_tensor_parallel_sizes_rejected(target, world):
+    with pytest.raises(ValueError, match="world_size"):
+        target.validate_shard(TensorParallelShard(0, world))
+
+
+def test_shard_alignment_rejected():
+    from ignition.recipes.ripple.config import ModelConfig
+
+    for key, value, message in (("vocab_size", 100352 + 64, "vocabulary"),
+                                ("intermediate_size", 40960 + 128, "intermediate_size"),
+                                ("num_key_value_heads", 2, "key/value heads")):
+        raw = copy.deepcopy(CONFIG) | {key: value}
+        with pytest.raises(ValueError, match=message):
+            ModelConfig.from_dict(raw).validate_shard(TensorParallelShard(0, 4))
+
+
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("drafting", [False, True])
+def test_pages_and_state_rows_match_declared_costs(drafted, world, drafting):
+    from ignition.recipes.ripple.pool import KV_DTYPE, ContinuationPool, continuation_layout, page_bytes
+
+    recipe = MODEL.recipe
+    shard = TensorParallelShard(world - 1, world)
+    costs = recipe.costs(world, recipe.speculation if drafting else None)
+    layout = continuation_layout(drafted, shard, draft=drafting)
+    assert layout.row_bytes == costs.state_row_bytes
+    assert page_bytes(drafted, shard) == costs.page_bytes == 80 * 2 * 128 * (8 // world) * 128 * 2
+    pool = ContinuationPool.for_model(drafted, 3, 2, "meta", shard=shard, draft=drafting)
+    assert pool.layout.row_bytes == costs.state_row_bytes
+    assert len(pool.pages) == 160 and sum(page[0].nbytes for page in pool.pages.values()) == costs.page_bytes
+    for layer in (0, 4, 79):
+        for cache in pool.attention(layer, drafted, shard):
+            assert cache.dtype == KV_DTYPE and cache.shape[1:] == (128, 8 // world, 128)
+    rings = [region for region in layout.regions if region.name.startswith("draft")]
+    assert len(rings) == (10 if drafting else 0)
+    for region in rings:
+        ring = pool.reserved_region(region.name)
+        assert ring.shape == (3, 4096, 8 // world, 128) and ring.dtype == torch.float8_e4m3fn
+    assert pool.reserved_region("last_hidden").shape == (3, 5120)
+    assert pool.reserved_region("consumed_tokens").dtype == torch.int64
+
+
+def test_draft_costs_only_add_rings():
+    recipe = MODEL.recipe
+    for world in (2, 4):
+        plain, drafting = recipe.costs(world, None), recipe.costs(world, recipe.speculation)
+        assert drafting.page_bytes == plain.page_bytes and drafting.graph_bytes == plain.graph_bytes
+        assert drafting.state_row_bytes - plain.state_row_bytes == 5 * 2 * 4096 * (8 // world) * 128
+
+
+def test_real_draft_config_geometry(target):
+    from ignition.recipes.ripple import draft_config
+
+    draft = draft_config.load(draft_snapshot(), target)
+    assert draft.rotary_layers == (True, True, True, True, False)
+    assert draft.full_attention_layers == (4,)
+    assert draft.convolution == (4, 16)
+    assert (draft.layers, draft.block_size, draft.noise_token) == (5, 16, 100278)
+    assert draft.target_layers == (1, 20, 39, 58, 77)
+    a = draft.attention
+    assert (a.heads, a.kv_heads, a.key_dim, a.value_dim, a.rotary_dim, a.theta, a.window) == (
+        80, 8, 128, 128, 128, 10000., 4096)
+    for world in (2, 4):
+        draft.validate_shard(TensorParallelShard(world - 1, world))
+        assert a.local(TensorParallelShard(0, world)) == (80 // world, 8 // world)
+
+
+def test_draft_context_and_proposal_scratch_follow_the_checkpoint(drafted):
+    from ignition.components.dflash2 import DraftScratch
+    from ignition.components.dflash2_geometry import draft_context_specs
+    from ignition.preparation.scratch import GraphBufferPool
+
+    for world in (2, 4):
+        shard = TensorParallelShard(0, world)
+        specs = {name: (shape, dtype) for name, shape, dtype in draft_context_specs(drafted.draft, shard)}
+        assert set(specs) == {f"draft{layer}.{part}" for layer in range(5) for part in ("key", "value")}
+        assert set(specs.values()) == {((4096, 8 // world, 128), torch.float8_e4m3fn)}
+        scratch = DraftScratch.allocate(drafted.draft, shard, 32, "meta", buffers=GraphBufferPool("meta").cursor())
+        # Each block of four taps carries per-group coefficients for its two convolutions.
+        assert scratch.convolution["coefficients"].shape == (32, 2 * 4 * 5120 // 16)
+        assert scratch.query.shape == (32, 80 // world, 128)
+        assert scratch.key.shape == scratch.value.shape == (32, 8 // world, 128)
+
+
+def test_draft_target_mismatch_rejected(target):
+    from ignition.recipes.ripple import draft_config
+
+    for change in (dict(hidden_size=4096), dict(vocab_size=100353), dict(num_target_layers=79)):
+        raw = copy.deepcopy(DRAFT_CONFIG) | change
+        with pytest.raises(ValueError):
+            draft_config.DFlash2Config.from_dict(raw, target_hidden=target.hidden,
+                target_vocabulary=target.vocabulary, target_layers=target.num_layers, expected=draft_config.PROFILE)
+
+
+def _geometry(raw, target, *, pinned):
+    from ignition.recipes.ripple import draft_config
+
+    # Without the pinned profile, only the shared geometry validator judges layer kinds and NoPE indices.
+    expected = draft_config.PROFILE if pinned else {
+        key: value for key, value in draft_config.PROFILE.items() if key not in ("layer_types", "no_rope_layers")}
+    return draft_config.DFlash2Config.from_dict(raw, target_hidden=target.hidden,
+        target_vocabulary=target.vocabulary, target_layers=target.num_layers, expected=expected)
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("value", [[5], [-1], [4, 4], [4, 2], [True], ["4"], 4, None, [4.]])
+def test_invalid_nope_layers_rejected(target, value, pinned):
+    raw = copy.deepcopy(DRAFT_CONFIG) | {"no_rope_layers": value}
+    with pytest.raises(ValueError, match=None if pinned else "NoPE layers"):
+        _geometry(raw, target, pinned=pinned)
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("layers", [
+    ["sliding_attention"] * 4 + ["linear_attention"], ["sliding_attention"] * 4 + ["chunked_attention"],
+    ["sliding_attention"] * 4, ["sliding_attention"] * 6, None, "full_attention",
+])
+def test_unknown_draft_layer_types_rejected(target, layers, pinned):
+    raw = copy.deepcopy(DRAFT_CONFIG) | {"layer_types": layers}
+    with pytest.raises(ValueError, match=None if pinned else "sliding or full attention"):
+        _geometry(raw, target, pinned=pinned)
+
+
+def test_geometry_validator_accepts_other_nope_selections(target):
+    raw = copy.deepcopy(DRAFT_CONFIG) | {"no_rope_layers": [0, 4], "layer_types": ["full_attention"] * 5}
+    draft = _geometry(raw, target, pinned=False)
+    assert draft.rotary_layers == (False, True, True, True, False)
+    assert draft.full_attention_layers == (0, 1, 2, 3, 4)
+    del raw["no_rope_layers"]
+    assert _geometry(raw, target, pinned=False).rotary_layers == (True,) * 5
+
+
+@pytest.mark.parametrize("key,value", [
+    ("block_size", 8), ("conv_kernel_size", 2), ("conv_group_size", 32), ("mask_token_id", 100277),
+    ("target_layer_ids", [1, 20, 39, 58, 78]), ("selector_top_k", 16),
+])
+def test_incompatible_draft_projector_rejected(target, key, value):
+    raw = copy.deepcopy(DRAFT_CONFIG)
+    raw["dflash_config"][key] = value
+    with pytest.raises(ValueError):
+        _geometry(raw, target, pinned=True)
+
+
+def test_qwen_dense_draft_profile_still_loads():
+    from ignition.recipes.qwen38_dense import draft_config
+    from ignition.recipes.qwen38_dense.config import ModelConfig
+    from tests.recipes.test_qwen38_dense_dflash import DRAFT_CONFIG as QWEN_DRAFT
+
+    qwen = ModelConfig(dict(hidden_size=5120, vocab_size=248320, num_hidden_layers=64, num_key_value_heads=4,
+        head_dim=256, layer_types=["full_attention" if i % 4 == 3 else "linear_attention" for i in range(64)]), {})
+    draft = draft_config.from_dict(copy.deepcopy(QWEN_DRAFT), qwen)
+    assert draft.rotary_layers == (True,) * 5
+    assert draft.full_attention_layers == ()
+    assert draft.convolution == (2, 16)
+    assert "no_rope_layers" not in draft_config.PROFILE
+    raw = copy.deepcopy(QWEN_DRAFT) | {"no_rope_layers": [4]}
+    with pytest.raises(ValueError, match="NoPE"):
+        draft_config.from_dict(raw | {"no_rope_layers": [5]}, qwen)
+    assert draft_config.from_dict(raw, qwen).rotary_layers == (True,) * 4 + (False,)
+
+
+def test_recipe_declaration():
+    from ignition.recipes.ripple.draft_config import REPOSITORY, REVISION, STORED_BYTES
+
+    recipe, checkpoint = MODEL.recipe, MODEL.checkpoint
+    assert recipe.name == "ripple" and recipe.served_model_name == "Ripple-65B-Preview"
+    assert resolve("ricursiveAI/Ripple-65B-Preview").checkpoint is checkpoint
+    assert (checkpoint.repository, checkpoint.revision) == (
+        "ricursiveAI/Ripple-65B-Preview", "240d5966cbe00f0627c699e59ef58560b60303cf")
+    assert (REPOSITORY, REVISION) == ("ricursiveAI/Ripple-65B-Preview-DFlash2",
+                                      "35609b3be3dd08a822b3ba1257c1ea5dd6f87632")
+    assert recipe.tensor_parallel == (2, 4)
+    assert (recipe.context, recipe.page_tokens, recipe.concurrency, recipe.max_concurrency, recipe.prefill_chunk) == (
+        262144, 128, 4, 32, 4096)
+    assert recipe.speculation.method == "dflash2" and recipe.speculation.draft_tokens == 15
+    assert recipe.speculation.packed_verification and recipe.speculation.token_capacity == 64
+    assert checkpoint.draft_bytes == STORED_BYTES + 100352 * 5120 * 2
+    assert checkpoint.device_bytes == checkpoint.stored_bytes + 2 * 100352 * 5120 * 2 + STORED_BYTES
+    for world in (2, 4):
+        plain = recipe.weights_bytes(checkpoint, world, None)
+        assert plain == -(-(checkpoint.stored_bytes + 100352 * 5120 * 2) // world)
+        assert recipe.weights_bytes(checkpoint, world, recipe.speculation) == -(-checkpoint.device_bytes // world)
+
+
+def test_declared_stored_bytes_match_the_target_tensors():
+    # Stored bytes count tensor data, as the index's total_size does, not safetensors headers.
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+
+    target = target_snapshot("config.json", "model.safetensors.index.json")
+    tensors = inspect_indexed_checkpoint(target).tensors.values()
+    assert {tensor.dtype for tensor in tensors} == {"BF16"}
+    total = json.loads((target / "model.safetensors.index.json").read_text())["metadata"]["total_size"]
+    assert sum(tensor.nbytes for tensor in tensors) == total == MODEL.checkpoint.stored_bytes
+
+
+def test_declared_draft_bytes_match_the_draft_tensors():
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    from ignition.recipes.ripple.draft_config import STORED_BYTES
+
+    draft = inspect_indexed_checkpoint(draft_snapshot("config.json", "model.safetensors"))
+    assert {tensor.dtype for tensor in draft.tensors.values()} == {"BF16"}
+    assert sum(tensor.nbytes for tensor in draft.tensors.values()) == STORED_BYTES
+
+
+def test_eos_ids_merge_config_and_tokenizer():
+    from ignition.recipes.ripple.bootstrap import _eos_ids
+    from ignition.recipes.ripple.config import ModelConfig
+
+    snapshot = target_snapshot("config.json", "tokenizer.json", "tokenizer_config.json")
+    assert _eos_ids(snapshot, ModelConfig.load(snapshot)) == [100265, 100257]
+
+
+def test_frontend_contract_declares_chatml_hermes_tools_and_think_tags():
+    from ignition.preparation import runtime_package_pb2 as p
+    from ignition.recipes.ripple.contract import FRONTEND
+
+    assert FRONTEND["tools"]["kind"] == p.HERMES_JSON
+    assert FRONTEND["reasoning"] == dict(kind=p.THINK_TAGS, open="<think>", close="</think>",
+                                         wrapping_newlines=1, terminal_markers=["<tool_call>"])
+    assert FRONTEND["assistant_marker"] == "<|im_start|>assistant\n"
+    assert FRONTEND["message_end_markers"] == ["<|im_end|>"]
+    assert FRONTEND["prefix_boundary"]["required_start"] == "<|im_start|>system\n"
+
+
+def test_speculative_catalog_and_explicit_ordinary_mode():
+    from ignition.recipes.ripple.bootstrap import PreparationConfig
+
+    recipe = MODEL.recipe
+    config = PreparationConfig(mtp=True, draft_snapshot=Path("draft"), max_active=recipe.concurrency,
+        speculative_widths=recipe.speculation.widths, speculative_token_capacity=recipe.speculation.token_capacity,
+        speculative_graph_budget=recipe.speculation.graph_budget)
+    shapes = set(config.speculative_round_shapes)
+    assert config.verification_width == 16
+    assert {(batch, 1, batch) for batch in (1, 2, 4)} <= shapes
+    assert (4, 16, 64) in shapes
+    assert all(batch <= packed <= min(64, batch * width) for batch, width, packed in shapes)
+    assert sum(width > 1 for _, width, _ in shapes) <= 24
+    plain = PreparationConfig()
+    assert plain.speculative_round_shapes == () and plain.verification_width == 1
+    fixed = PreparationConfig(mtp=True, draft_snapshot=Path("draft"), speculative_widths=(1, 4, 8),
+                              speculative_fixed_width=4)
+    assert {width for _, width, _ in fixed.speculative_round_shapes} == {1, 4}
+
+
+@pytest.mark.parametrize("options,error", [
+    (dict(mtp=True), ValueError), (dict(mtp=True, draft_snapshot=Path("d"), speculative_widths=(1, 17)), ValueError),
+    (dict(mtp=True, draft_snapshot=Path("d"), speculative_widths=(1, 4), speculative_fixed_width=8), ValueError),
+    (dict(devices=(0, 1, 2)), ValueError), (dict(devices=(0, 0)), ValueError), (dict(context=1000), ValueError),
+    (dict(prefill_chunk_size=100), ValueError), (dict(mtp=1), TypeError), (dict(online_mxfp8="yes"), TypeError),
+])
+def test_preparation_config_rejections(options, error):
+    from ignition.recipes.ripple.bootstrap import PreparationConfig
+
+    with pytest.raises(error):
+        PreparationConfig(**options)
+
+
+@pytest.mark.parametrize("drafting", [False, True])
+def test_two_rtx_pro_6000_plan_fits(drafting):
+    from ignition import planning
+
+    recipe, checkpoint = MODEL.recipe, MODEL.checkpoint
+    gpus = tuple(planning.Gpu(i, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{i}", 96 << 30, 95 << 30, (12, 0))
+                 for i in range(2))
+    plan = planning.fit(recipe, checkpoint, gpus, concurrency=4, reserve_bytes=0,
+                        speculation=recipe.speculation if drafting else None)
+    assert plan.world_size == 2 and plan.concurrency == 4
+    assert plan.costs == recipe.costs(2, recipe.speculation if drafting else None)
+    assert plan.weights_bytes == recipe.weights_bytes(checkpoint, 2, plan.speculation)

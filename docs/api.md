@@ -562,6 +562,7 @@ in both cards. Changing request reasoning mode does not change sampling defaults
 | `kimi3` | 1 | 1 | Disabled | Top-p [0.95, 1] | [Kimi-K3 single-step/agentic evaluations](https://huggingface.co/moonshotai/Kimi-K3#3-evaluation-results) |
 | `step5` | 1 | 0.95 | Disabled | None | [Step-5-Preview-NVFP4 inference recommendations](https://huggingface.co/stepfun-ai/Step-5-Preview-NVFP4#evaluation-notes) |
 | `nemotron_h` | 1 | 0.95 | Disabled | None | [Nemotron-3.5-Bolt text recommendations](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB#model-summary) |
+| `ripple` | 1 | 1 | Disabled | None | [Ripple-65B-Preview](https://huggingface.co/ricursiveAI/Ripple-65B-Preview) recommends none |
 
 All recipes default to `min_p=0`, `repetition_penalty=1`, and zero presence and
 frequency penalties. Unspecified filters are disabled and unspecified penalties
