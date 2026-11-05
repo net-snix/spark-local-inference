@@ -19,6 +19,27 @@ ARCHITECTURE = "RicursiveForCausalLM"
 PAGE_TOKENS = 128
 
 
+# Decoder projections a quantized Ripple checkpoint may store as MXFP8; embeddings, the
+# vocabulary head, normalization and value-residual weights stay BF16.
+PROJECTIONS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.g_proj",
+               "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+
+
+def _validate_mxfp8_projections(raw):
+    """Accept only ModelOpt MXFP8 (E4M3 values, UE8M0 scales per 32 inputs) on every decoder projection."""
+    quant = raw["quantization_config"]
+    if (not isinstance(quant, dict) or quant.get("quant_method") != "modelopt"
+            or quant.get("quant_algo") != "MIXED_PRECISION" or quant.get("kv_cache_quant_algo") is not None):
+        raise ValueError("Ripple quantized checkpoints must declare modelopt MIXED_PRECISION with BF16 KV")
+    layers = quant.get("quantized_layers")
+    expected = {f"model.layers.{index}.{name}" for index in range(raw.get("num_hidden_layers", 0))
+                for name in PROJECTIONS}
+    if not isinstance(layers, dict) or set(layers) != expected or any(
+            entry != {"quant_algo": "MXFP8", "weight_block_size": [1, 32]} for entry in layers.values()):
+        raise ValueError("Ripple quantized checkpoints must store every decoder projection, and only those, "
+                         "as MXFP8 with 32-element blocks")
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     text: dict
@@ -33,7 +54,7 @@ class ModelConfig:
         if raw.get("architectures") != [ARCHITECTURE]:
             raise ValueError(f"Ripple preparation requires {ARCHITECTURE}")
         if raw.get("quantization_config") is not None:
-            raise ValueError("Ripple preparation serves the unquantized BF16 checkpoint")
+            _validate_mxfp8_projections(raw)
         required = {"model_type": "ricursive", "hidden_act": "silu", "head_dim": 128,
                     "use_gated_attention": True, "gate_full_precision": True, "use_valres": True,
                     "tie_word_embeddings": False}
@@ -71,6 +92,11 @@ class ModelConfig:
             raise ValueError("Ripple vocabulary must partition into 64-aligned rank shards")
         if self.intermediate_size % (shard.world_size * 128):
             raise ValueError("Ripple intermediate_size must divide into 128-aligned rank shards")
+
+    @property
+    def mxfp8_projections(self) -> bool:
+        """Whether the checkpoint stores its decoder projections as MXFP8."""
+        return self.text.get("quantization_config") is not None
 
     @property
     def layers(self) -> tuple[str, ...]:

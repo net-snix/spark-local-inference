@@ -1089,7 +1089,8 @@ flare/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --
 ## Ripple 65B Preview
 
 `ripple-65b` prepares `ricursiveAI/Ripple-65B-Preview` for BF16 text generation
-across two or four GPUs of the same architecture. The dense decoder has 80
+across two or four GPUs of the same architecture, and `ripple-65b-mxfp8` prepares
+a local MXFP8 build of it on one, two or four GPUs. The dense decoder has 80
 layers: four of every five use 1,024-token sliding-window attention with rotary
 positions, and every fifth layer is global attention without positions. Each
 layer applies normalization before and after attention and the MLP, a sigmoid
@@ -1123,12 +1124,39 @@ The recipe context capacity is 262144 tokens, but BF16 weights leave room for
 roughly 150,000 KV tokens across all requests on two 96 GB GPUs. A runtime
 request is limited to the KV pages actually allocated, after the draft rings are
 reserved. The recipe is validated with tensor parallelism two on RTX PRO 6000
-Blackwell GPUs. `--no-mtp` skips the draft download and omits its weights,
+Blackwell GPUs, and `ripple-65b-mxfp8` also on one. `--no-mtp` skips the draft download and omits its weights,
 rings, and speculative graphs.
 `--online-mxfp8` converts target and draft attention and MLP projections to MXFP8
 while loading. It halves decode weight traffic and, on two RTX PRO 6000 GPUs,
 raises the KV budget to about 345,000 tokens, enough for one full-context
 request. MXFP8 changes the checkpoint arithmetic, so BF16 remains the default.
+
+`ripple-65b-mxfp8` serves `/data/models/Ripple-65B-Preview-MXFP8-GPTQ`, a ModelOpt
+`MIXED_PRECISION` checkpoint that stores all 640 decoder projections as MXFP8
+(`F8_E4M3` `weight` plus `U8` UE8M0 `weight_scale` per 32 inputs) and keeps the
+embedding, vocabulary head, norms and value-residual weights in BF16: 67.8 GB of
+tensors, so target and draft fit on one 96 GB GPU. The loader accepts exactly that
+declaration, checks every stored shape, and loads the payloads unchanged. Those
+projections run weight-only (BF16 activations, `a16`), which is the arithmetic of
+the dequantized checkpoint. The weights come from sequential GPTQ inside the MXFP8
+grid (scale `2^ceil(log2(amax/448))` per 32, the same grid `--online-mxfp8` uses)
+on 128 Nemotron calibration sequences. Against BF16 on 120 held-out 2,048-token
+sequences (teacher-forced, full-vocabulary KL(BF16 || MXFP8)), mean KL is 0.00266
+(95% CI 0.00216-0.00320) with 98.82% top-1 agreement. Round-to-nearest MXFP8 scores
+0.00614 and 98.19%. The checkpoint's README and `quantization/` directory record the
+data, scripts and per-sequence results. On one GPU, `--online-mxfp8` converts only
+the BF16 draft, and 2,048-token prefill chunks keep kernel tuning within memory:
+weight-only split-K candidates for the 4,096-row gate/up projection reserve 20 GiB
+of scratch, more than one 96 GB GPU has left after the weights.
+
+```sh
+.venv/bin/ignition export ripple-65b-mxfp8 --gpus 0 --online-mxfp8 --prefill-chunk-size 2048
+flare run PACKAGE --gpus 0
+```
+
+On one RTX PRO 6000 that leaves about 68,000 KV tokens (about 50,000 per request).
+Weight-only GEMMs keep decode near the two-GPU BF16 package, but prefill runs at
+about 1,000 tokens per second.
 
 ## Storage and graph capacities
 

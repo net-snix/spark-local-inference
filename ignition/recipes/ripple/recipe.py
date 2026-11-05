@@ -14,6 +14,12 @@ from .draft_config import STORED_BYTES as _DRAFT_BYTES
 
 _GRAPH_BYTES = 4 << 30
 _EMBEDDING_BYTES = 100_352 * 5_120 * 2
+_BF16_BYTES = 129_565_378_720
+# GPTQ MXFP8 build: 63.75B projection weights at one E4M3 byte plus one UE8M0 scale byte per 32,
+# and the BF16 embedding, vocabulary head, norms and value-residual weights unchanged.
+_MXFP8_BYTES = 65_745_715_200 + 2_058_537_120
+# b12x keeps each projection's UE8M0 scales twice on the device: as loaded and in MMA layout.
+_MXFP8_SCALE_BYTES = 63_753_420_800 // 32
 
 
 def _costs(world: int, *, draft: bool) -> RankCosts:
@@ -80,8 +86,15 @@ RECIPE = Recipe(
     # when speculation is off.
     checkpoints=(Checkpoint(alias="ripple-65b", repository="ricursiveAI/Ripple-65B-Preview",
         revision="240d5966cbe00f0627c699e59ef58560b60303cf", architecture="RicursiveForCausalLM",
-        stored_bytes=129_565_378_720, device_bytes=129_565_378_720 + 2 * _EMBEDDING_BYTES + _DRAFT_BYTES,
-        decode_weight_bytes=129_565_378_720, draft_bytes=_DRAFT_BYTES + _EMBEDDING_BYTES),),
+        stored_bytes=_BF16_BYTES, device_bytes=_BF16_BYTES + 2 * _EMBEDDING_BYTES + _DRAFT_BYTES,
+        decode_weight_bytes=_BF16_BYTES, draft_bytes=_DRAFT_BYTES + _EMBEDDING_BYTES),
+        # A local GPTQ MXFP8 build of the same checkpoint that fits one 96 GB GPU; see
+        # docs/model-preparation.md for how it is made and its measured KL divergence.
+        Checkpoint(alias="ripple-65b-mxfp8", repository="/data/models/Ripple-65B-Preview-MXFP8-GPTQ",
+        revision="local", architecture="RicursiveForCausalLM",
+        stored_bytes=_MXFP8_BYTES, device_bytes=_MXFP8_BYTES + 2 * _EMBEDDING_BYTES + _DRAFT_BYTES,
+        decode_weight_bytes=_MXFP8_BYTES, draft_bytes=_DRAFT_BYTES + _EMBEDDING_BYTES,
+        expansion_bytes=_MXFP8_SCALE_BYTES)),
     context=262144, page_tokens=128, concurrency=4, max_concurrency=32, prefill_chunk=4096,
     # DFlash2 proposes sixteen-token blocks; verification reads every weight once per round, so
     # wide rounds cost little more than one token on this bandwidth-bound dense target.
@@ -91,6 +104,6 @@ RECIPE = Recipe(
     # --online-mxfp8 stores target and draft projections as MXFP8 while loading: about half the
     # decode weight traffic, at the cost of checkpoint precision. BF16 is the default.
     online_mxfp8=True,
-    ranks=MappingProxyType({world: _costs(world, draft=True) for world in (2, 4)}),
-    plain_ranks=MappingProxyType({world: _costs(world, draft=False) for world in (2, 4)}),
+    ranks=MappingProxyType({world: _costs(world, draft=True) for world in (1, 2, 4)}),
+    plain_ranks=MappingProxyType({world: _costs(world, draft=False) for world in (1, 2, 4)}),
 )

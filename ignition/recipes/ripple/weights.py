@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Ripple BF16 checkpoint transfers with tensor-parallel slices and fused projections.
+"""Ripple checkpoint transfers with tensor-parallel slices and fused projections.
+
+BF16 checkpoints load projections as BF16, optionally converted to MXFP8 while loading.
+Checkpoints that store ModelOpt MXFP8 projections load their E4M3 values and UE8M0 scales
+unchanged through the shared quantized loader.
 
 Projections sharing an input are packed once while loading: each rank's query, output
 gate, and key rows form one `qgk` projection of the normalized hidden state, and its
@@ -88,6 +92,15 @@ class RippleWeightLoader(DirectWeightLoader):
             raise ValueError(f"{name}: expected BF16 {shape}, got {source.dtype} {tuple(source.shape)}")
         return source
 
+    def _mxfp8_source(self, prefix: str, shape: tuple[int, int]) -> None:
+        """Require a stored MXFP8 projection's E4M3 values and UE8M0 scales to match the model."""
+        weight, scale = self._sources[f"{prefix}.weight"], self._sources[f"{prefix}.weight_scale"]
+        if weight.dtype != torch.float8_e4m3fn or tuple(weight.shape) != shape:
+            raise ValueError(f"{prefix}.weight: expected F8_E4M3 {shape}, got {weight.dtype} {tuple(weight.shape)}")
+        if scale.dtype != torch.uint8 or tuple(scale.shape) != (shape[0], shape[1] // 32):
+            raise ValueError(f"{prefix}.weight_scale: expected U8 {(shape[0], shape[1] // 32)}, "
+                             f"got {scale.dtype} {tuple(scale.shape)}")
+
     def _rows(self, parts) -> torch.Tensor:
         """Pack row slices of several checkpoint matrices into one contiguous projection."""
         rows = sum(last - first for _, first, last in parts)
@@ -127,6 +140,29 @@ class RippleWeightLoader(DirectWeightLoader):
         blend = self.load_tensor(f"{prefix}.self_attn.value_res_lambda")
         if blend.shape != (1,):
             raise ValueError(f"{prefix}.self_attn.value_res_lambda: expected shape (1,)")
+        if c.mxfp8_projections:
+            attention, mlp = f"{prefix}.self_attn", f"{prefix}.mlp"
+            q_rows, kv_rows, inner = c.heads * dim, c.kv_heads * dim, c.intermediate_size
+            for name, shape in ((f"{attention}.q_proj", (q_rows, hidden)), (f"{attention}.g_proj", (q_rows, hidden)),
+                                (f"{attention}.k_proj", (kv_rows, hidden)), (f"{attention}.v_proj", (kv_rows, hidden)),
+                                (f"{attention}.o_proj", (hidden, q_rows)), (f"{mlp}.gate_proj", (inner, hidden)),
+                                (f"{mlp}.up_proj", (inner, hidden)), (f"{mlp}.down_proj", (hidden, inner))):
+                self._mxfp8_source(name, shape)
+            projections = dict(
+                qgk=self.load_linear_group((f"{attention}.q_proj", f"{attention}.g_proj", f"{attention}.k_proj"),
+                                           row_ranges=((q0, q1), (q0, q1), (k0, k1))),
+                v_proj=self.load_linear(f"{attention}.v_proj", rows=(k0, k1)),
+                o_proj=self.load_linear(f"{attention}.o_proj", columns=(q0, q1)),
+                gate_up=self.load_linear_group((f"{mlp}.gate_proj", f"{mlp}.up_proj"),
+                                               row_ranges=((r0, r1), (r0, r1))),
+                down_proj=self.load_linear(f"{mlp}.down_proj", columns=(r0, r1)),
+            )
+            shapes = dict(qgk=(2 * (q1 - q0) + k1 - k0, hidden), v_proj=(k1 - k0, hidden), o_proj=(hidden, q1 - q0),
+                          gate_up=(2 * (r1 - r0), hidden), down_proj=(hidden, r1 - r0))
+            for name, weight in projections.items():
+                if (weight.out_features, weight.in_features) != shapes[name]:
+                    raise ValueError(f"{prefix}.{name}: MXFP8 projection shape disagrees with the model")
+            return dict(norms, value_blend=blend, **projections)
         q = self._source(f"{prefix}.self_attn.q_proj.weight", (c.heads * dim, hidden))
         g = self._source(f"{prefix}.self_attn.g_proj.weight", (c.heads * dim, hidden))
         k = self._source(f"{prefix}.self_attn.k_proj.weight", (c.kv_heads * dim, hidden))
@@ -142,6 +178,7 @@ class RippleWeightLoader(DirectWeightLoader):
         )
         if self.online_mxfp8:
             # Optional bandwidth trade: each layer's BF16 projections become b12x MXFP8 as they load.
+            # A checkpoint that already stores MXFP8 projections returns above unchanged.
             projections = {name: quantize_bf16_linear_as_mxfp8(weight) for name, weight in projections.items()}
         # value_blend keeps the raw lambda; the decoder applies sigmoid in the parameter dtype.
         return dict(norms, value_blend=blend, **projections)

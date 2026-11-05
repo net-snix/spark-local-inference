@@ -80,9 +80,15 @@ class PreparedLayer:
         def zeros(shape):
             return buffers.zeros(shape, torch.bfloat16)
 
+        # A checkpoint that stores MXFP8 projections runs them weight-only: BF16 activations times
+        # E4M3 x 2^e weights, exactly the dequantized checkpoint whose KL divergence against BF16
+        # was measured (SM120 kernels; the SM103 planner chooses its own mode). BF16 projections,
+        # and those converted by --online-mxfp8, let the tuner choose per shape.
+        activation_mode = "a16" if config.mxfp8_projections else "auto"
+
         def projection(inputs, weight, output, field):
             return prepare_projection(inputs, weight, output, session=session, name=f"{name}.{field}",
-                                      workspace=workspace)
+                                      workspace=workspace, activation_mode=activation_mode)
 
         self.normed = source
         self.value_input = zeros((tokens, config.hidden))

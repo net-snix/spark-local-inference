@@ -150,6 +150,7 @@ def test_missing_required_fields_rejected(key):
 
 
 @pytest.mark.parametrize("world,q,kv,intermediate,vocabulary", [
+    (1, 10240, 1024, 40960, 100352),
     (2, 5120, 512, 20480, 50176),
     (4, 2560, 256, 10240, 25088),
 ])
@@ -188,7 +189,7 @@ def test_shard_alignment_rejected():
             ModelConfig.from_dict(raw).validate_shard(TensorParallelShard(0, 4))
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [1, 2, 4])
 @pytest.mark.parametrize("drafting", [False, True])
 def test_pages_and_state_rows_match_declared_costs(drafted, world, drafting):
     from ignition.recipes.ripple.pool import KV_DTYPE, ContinuationPool, continuation_layout, page_bytes
@@ -216,7 +217,7 @@ def test_pages_and_state_rows_match_declared_costs(drafted, world, drafting):
 
 def test_draft_costs_only_add_rings():
     recipe = MODEL.recipe
-    for world in (2, 4):
+    for world in (1, 2, 4):
         plain, drafting = recipe.costs(world, None), recipe.costs(world, recipe.speculation)
         assert drafting.page_bytes == plain.page_bytes and drafting.graph_bytes == plain.graph_bytes
         assert drafting.state_row_bytes - plain.state_row_bytes == 5 * 2 * 4096 * (8 // world) * 128
@@ -343,7 +344,7 @@ def test_recipe_declaration():
         "ricursiveAI/Ripple-65B-Preview", "240d5966cbe00f0627c699e59ef58560b60303cf")
     assert (REPOSITORY, REVISION) == ("ricursiveAI/Ripple-65B-Preview-DFlash2",
                                       "35609b3be3dd08a822b3ba1257c1ea5dd6f87632")
-    assert recipe.tensor_parallel == (2, 4)
+    assert recipe.tensor_parallel == (1, 2, 4)
     assert (recipe.context, recipe.page_tokens, recipe.concurrency, recipe.max_concurrency, recipe.prefill_chunk) == (
         262144, 128, 4, 32, 4096)
     assert recipe.speculation.method == "dflash2" and recipe.speculation.draft_tokens == 15
@@ -441,3 +442,178 @@ def test_two_rtx_pro_6000_plan_fits(drafting):
     assert plan.world_size == 2 and plan.concurrency == 4
     assert plan.costs == recipe.costs(2, recipe.speculation if drafting else None)
     assert plan.weights_bytes == recipe.weights_bytes(checkpoint, 2, plan.speculation)
+
+
+# MXFP8 checkpoint: ModelOpt MIXED_PRECISION with every decoder projection, and only those, as MXFP8.
+
+MXFP8_DIRECTORY = "/data/models/Ripple-65B-Preview-MXFP8-GPTQ"
+
+
+def mxfp8_config():
+    from ignition.recipes.ripple.config import PROJECTIONS
+
+    return copy.deepcopy(CONFIG) | {"quantization_config": {
+        "quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", "kv_cache_quant_algo": None,
+        "quantized_layers": {f"model.layers.{index}.{name}": {"quant_algo": "MXFP8", "weight_block_size": [1, 32]}
+                             for index in range(80) for name in PROJECTIONS}}}
+
+
+def mxfp8_checkpoint():
+    return next(checkpoint for checkpoint in MODEL.recipe.checkpoints if checkpoint.alias == "ripple-65b-mxfp8")
+
+
+def test_mxfp8_checkpoint_config_is_accepted():
+    from ignition.recipes.ripple.config import ModelConfig
+
+    assert ModelConfig.from_dict(mxfp8_config()).mxfp8_projections
+    assert not ModelConfig.from_dict(copy.deepcopy(CONFIG)).mxfp8_projections
+
+
+def _drop_one(layers):
+    del layers["model.layers.79.mlp.down_proj"]
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda quant: quant.update(kv_cache_quant_algo="FP8"),
+    lambda quant: quant.update(quant_algo="MXFP8"),
+    lambda quant: quant.update(quant_method="compressed-tensors"),
+    lambda quant: quant.pop("quantized_layers"),
+    lambda quant: _drop_one(quant["quantized_layers"]),
+    lambda quant: quant["quantized_layers"].update({"lm_head": {"quant_algo": "MXFP8", "weight_block_size": [1, 32]}}),
+    lambda quant: quant["quantized_layers"].update({"model.layers.0.self_attn.q_proj": {"quant_algo": "NVFP4",
+                                                                                           "group_size": 16}}),
+    lambda quant: quant["quantized_layers"].update({"model.layers.0.self_attn.v_proj": {
+        "quant_algo": "MXFP8", "weight_block_size": [1, 16]}}),
+])
+def test_mxfp8_checkpoint_config_rejections(mutate):
+    from ignition.recipes.ripple.config import ModelConfig
+
+    raw = mxfp8_config()
+    mutate(raw["quantization_config"])
+    with pytest.raises(ValueError):
+        ModelConfig.from_dict(raw)
+
+
+MXFP8_SHAPES = {"self_attn.q_proj": (10240, 5120), "self_attn.g_proj": (10240, 5120),
+                "self_attn.k_proj": (1024, 5120), "self_attn.v_proj": (1024, 5120),
+                "self_attn.o_proj": (5120, 10240), "mlp.gate_proj": (40960, 5120),
+                "mlp.up_proj": (40960, 5120), "mlp.down_proj": (5120, 40960)}
+
+
+def _mxfp8_layer_loader(monkeypatch, world, *, index=7, shapes=MXFP8_SHAPES, scale_dtype=torch.uint8):
+    from types import SimpleNamespace
+
+    from ignition.recipes.ripple.config import ModelConfig
+    from ignition.recipes.ripple.weights import RippleWeightLoader
+
+    loader = object.__new__(RippleWeightLoader)
+    # Stored MXFP8 is never requantized, even when online conversion is requested for the draft.
+    loader.config, loader.shard, loader.online_mxfp8 = (ModelConfig.from_dict(mxfp8_config()),
+                                                        TensorParallelShard(world - 1, world), True)
+    loader._sources = {}
+    for name, (rows, columns) in shapes.items():
+        loader._sources[f"model.layers.{index}.{name}.weight"] = torch.empty(
+            (rows, columns), dtype=torch.float8_e4m3fn, device="meta")
+        loader._sources[f"model.layers.{index}.{name}.weight_scale"] = torch.empty(
+            (rows, columns // 32), dtype=scale_dtype, device="meta")
+    calls = {}
+
+    def load_linear_group(prefixes, *, row_ranges=None, column_range=None):
+        calls[tuple(name.rsplit(".", 1)[-1] for name in prefixes)] = (prefixes, tuple(row_ranges), column_range)
+        out = sum((r[1] - r[0]) if r is not None else loader._sources[f"{p}.weight"].shape[0]
+                  for p, r in zip(prefixes, row_ranges))
+        width = loader._sources[f"{prefixes[0]}.weight"].shape[1]
+        return SimpleNamespace(out_features=out,
+                               in_features=width if column_range is None else column_range[1] - column_range[0])
+
+    monkeypatch.setattr(loader, "_require_open", lambda: None)
+    monkeypatch.setattr(loader, "load_linear_group", load_linear_group)
+    monkeypatch.setattr(loader, "load_tensors", lambda names: [
+        torch.ones(128 if ".self_attn." in name else 5120, dtype=torch.bfloat16) for name in names])
+    monkeypatch.setattr(loader, "load_tensor", lambda name: torch.zeros(1, dtype=torch.bfloat16))
+    return loader, calls
+
+
+@pytest.mark.parametrize("world", [1, 2, 4])
+def test_mxfp8_layer_loads_stored_projections_for_the_last_rank(monkeypatch, world):
+    loader, calls = _mxfp8_layer_loader(monkeypatch, world)
+    layer = loader.load_layer(7)
+    rank = world - 1
+    q = (rank * 10240 // world, (rank + 1) * 10240 // world)
+    kv = (rank * 1024 // world, (rank + 1) * 1024 // world)
+    ffn = (rank * 40960 // world, (rank + 1) * 40960 // world)
+    a, m = "model.layers.7.self_attn", "model.layers.7.mlp"
+    assert calls == {
+        ("q_proj", "g_proj", "k_proj"): ((f"{a}.q_proj", f"{a}.g_proj", f"{a}.k_proj"), (q, q, kv), None),
+        ("v_proj",): ((f"{a}.v_proj",), (kv,), None),
+        ("o_proj",): ((f"{a}.o_proj",), (None,), q),
+        ("gate_proj", "up_proj"): ((f"{m}.gate_proj", f"{m}.up_proj"), (ffn, ffn), None),
+        ("down_proj",): ((f"{m}.down_proj",), (None,), ffn),
+    }
+    assert set(layer) == {"input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm",
+                          "post_feedforward_layernorm", "q_norm", "k_norm", "value_blend",
+                          "qgk", "v_proj", "o_proj", "gate_up", "down_proj"}
+
+
+@pytest.mark.parametrize("projection,shape", [
+    ("self_attn.q_proj", (10368, 5120)), ("self_attn.k_proj", (2048, 5120)), ("self_attn.v_proj", (1024, 5152)),
+    ("self_attn.o_proj", (5120, 10272)), ("mlp.up_proj", (41216, 5120)), ("mlp.down_proj", (5120, 41216)),
+])
+def test_mxfp8_stored_shape_mismatch_rejected_before_loading(monkeypatch, projection, shape):
+    loader, calls = _mxfp8_layer_loader(monkeypatch, 2, shapes=MXFP8_SHAPES | {projection: shape})
+    with pytest.raises(ValueError, match=projection):
+        loader.load_layer(7)
+    assert not calls
+
+
+def test_mxfp8_scale_dtype_mismatch_rejected(monkeypatch):
+    loader, _ = _mxfp8_layer_loader(monkeypatch, 1, scale_dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="weight_scale"):
+        loader.load_layer(7)
+
+
+def test_mxfp8_checkpoint_declaration():
+    checkpoint = mxfp8_checkpoint()
+    assert (checkpoint.repository, checkpoint.revision) == (MXFP8_DIRECTORY, "local")
+    # One E4M3 byte plus one UE8M0 scale byte per 32 inputs for every decoder projection; the
+    # embedding, vocabulary head, norms and value-residual weights stay BF16.
+    projections = 80 * (2 * 10240 * 5120 + 2 * 1024 * 5120 + 5120 * 10240 + 3 * 40960 * 5120)
+    bf16 = MODEL.checkpoint.stored_bytes - 2 * projections
+    assert checkpoint.stored_bytes == projections + projections // 32 + bf16
+    assert checkpoint.device_bytes - checkpoint.stored_bytes == (MODEL.checkpoint.device_bytes
+                                                                 - MODEL.checkpoint.stored_bytes)
+    assert checkpoint.draft_bytes == MODEL.checkpoint.draft_bytes
+    # Loaded scales stay resident beside their MMA-layout copy.
+    assert checkpoint.expansion_bytes == projections // 32 and MODEL.checkpoint.expansion_bytes == 0
+
+
+@pytest.mark.parametrize("drafting", [False, True])
+def test_mxfp8_checkpoint_fits_one_rtx_pro_6000(drafting):
+    from ignition import planning
+
+    recipe = MODEL.recipe
+    gpu = (planning.Gpu(0, "NVIDIA RTX PRO 6000 Blackwell", "GPU-0", 96 << 30, 95 << 30, (12, 0)),)
+    speculation = recipe.speculation if drafting else None
+    plan = planning.fit(recipe, mxfp8_checkpoint(), gpu, concurrency=4, reserve_bytes=0, speculation=speculation)
+    assert plan.world_size == 1 and plan.costs == recipe.costs(1, speculation)
+    assert plan.weights_bytes == recipe.weights_bytes(mxfp8_checkpoint(), 1, plan.speculation)
+    assert plan.weights_bytes < 80 << 30
+
+
+def test_mxfp8_checkpoint_tensors_match_the_declaration():
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    from ignition.recipes.ripple.config import PROJECTIONS, ModelConfig
+
+    directory = Path(os.environ.get("FLARE_RIPPLE_MXFP8_CHECKPOINT", MXFP8_DIRECTORY))
+    if not (directory / "model.safetensors.index.json").is_file():
+        pytest.skip(f"set FLARE_RIPPLE_MXFP8_CHECKPOINT or provide {MXFP8_DIRECTORY}")
+    assert ModelConfig.load(directory).mxfp8_projections
+    tensors = inspect_indexed_checkpoint(directory).tensors
+    quantized = {f"model.layers.{index}.{name}" for index in range(80) for name in PROJECTIONS}
+    for name, tensor in tensors.items():
+        prefix, _, field = name.rpartition(".")
+        expected = ({"weight": "F8_E4M3", "weight_scale": "U8"}[field] if prefix in quantized else "BF16")
+        assert tensor.dtype == expected, name
+    assert {f"{prefix}.{field}" for prefix in quantized for field in ("weight", "weight_scale")} <= set(tensors)
+    total = json.loads((directory / "model.safetensors.index.json").read_text())["metadata"]["total_size"]
+    assert sum(tensor.nbytes for tensor in tensors.values()) == total == mxfp8_checkpoint().stored_bytes
