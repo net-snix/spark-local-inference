@@ -107,6 +107,7 @@ class PreparedContext:
         self.value = scratch.zeros((tokens, kv_heads, a.value_dim), torch.bfloat16)
         self.slots = scratch.full((tokens,), -1, torch.int64)
         self.inverse = _inverse(a, auxiliary.device)
+        self.rotary_layers = c.rotary_layers
         self.project = prepare_projection(auxiliary, weights.draft.projection, self.local,
             session=session, name=name + ".project", workspace=workspace)
         self.gather = PreparedChunkedAllGather(self.local, self.projected, runtime=runtime,
@@ -147,9 +148,10 @@ class PreparedContext:
         self.project_kv(self.projected)
         width = self.key.shape[1] * self.key.shape[2]
         chunks = self.kv.view(self.kv.shape[0], len(self.layers), 2 * width)
+        rotary = self.rotary_layers
         for index, (norm, writer) in enumerate(self.layers):
             key = norm(chunks[:, index, :width].view_as(self.key))
-            self.key.copy_(_rotary(key, positions, self.inverse))
+            self.key.copy_(_rotary(key, positions, self.inverse) if rotary[index] else key)
             self.value.copy_(chunks[:, index, width:].view_as(self.value))
             writer()
 
@@ -196,7 +198,8 @@ class DraftScratch:
         vocab_width = ((c["vocab_size"] + shard.world_size - 1) // shard.world_size + 63) // 64 * 64
         def zeros(*shape, dtype=torch.bfloat16):
             return s.zeros(shape, dtype)
-        convolution = dict(coefficients=zeros(tokens, 2 * 2 * hidden // 16),
+        taps, group = config.convolution
+        convolution = dict(coefficients=zeros(tokens, 2 * taps * hidden // group),
                            before=zeros(tokens, hidden), after=zeros(tokens, hidden))
         return cls(zeros(tokens, hidden // shard.world_size), zeros(tokens, hidden), zeros(tokens, hidden),
             zeros(tokens, heads * a.key_dim + kv_heads * (a.key_dim + a.value_dim)),
@@ -232,6 +235,7 @@ class DraftAttention:
         self.q_norm = _norm(weights.query_norm, config.text["rms_norm_eps"])
         self.k_norm = _norm(weights.key_norm, config.text["rms_norm_eps"])
         self.inverse = _inverse(a, source.device)
+        self.rotary = config.rotary_layers[index]
         self.history_key, self.history_value = (pool.reserved_region(f"draft{index}.{kind}")
                                                for kind in ("key", "value"))
         rows = metadata.lengths.numel()
@@ -254,8 +258,11 @@ class DraftAttention:
     def __call__(self, source):
         s, m = self.scratch, self.metadata
         q, k, v = self.qkv(source).split((s.query[0].numel(), s.key[0].numel(), s.value[0].numel()), -1)
-        s.query.copy_(_rotary(self.q_norm(q.view_as(s.query)), m.positions, self.inverse))
-        s.key.copy_(_rotary(self.k_norm(k.view_as(s.key)), m.positions, self.inverse))
+        query, key = self.q_norm(q.view_as(s.query)), self.k_norm(k.view_as(s.key))
+        if self.rotary:
+            query, key = _rotary(query, m.positions, self.inverse), _rotary(key, m.positions, self.inverse)
+        s.query.copy_(query)
+        s.key.copy_(key)
         s.value.copy_(v.view_as(s.value))
         self.staging()
         self.lengths.copy_(torch.where(m.lengths > 0, m.starts.clamp(max=self.window) + m.lengths, 0).int())
@@ -269,6 +276,7 @@ class PreparedDraft:
                  output_multiplier, final_logit_softcapping):
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
         c, s = weights.config.draft, scratch
+        _, group = c.convolution
         stages = buffers.fork()
         self.embedding = PreparedShardedEmbedding(embedding, metadata.token_ids, s.local_embedding, s.embedding,
             runtime=embedding_runtime, coordinator=coordinator, session=session, name=name + ".embedding",
@@ -277,7 +285,7 @@ class PreparedDraft:
         for index, layer in enumerate(weights.draft.layers):
             prefix = f"{name}.layer{index}"
             conv = {kind: PreparedGroupedConvolution(s.normalized, getattr(layer, kind), block_size=s.block_size,
-                group_size=16, session=session, name=prefix + "." + kind, buffers=s.convolution,
+                group_size=group, session=session, name=prefix + "." + kind, buffers=s.convolution,
                 token_capacity=s.convolution["before"].shape[0]) for kind in ("attention_conv", "mlp_conv")}
             attention = DraftAttention(index, layer, conv["attention_conv"].before, c, weights.shard, s, metadata, pool,
                 runtime=runtime, coordinator=coordinator, session=session, name=prefix + ".attention",

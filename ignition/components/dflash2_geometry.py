@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Grouped-query attention geometry for full-rotary DFlash2 drafts."""
+"""Grouped-query attention geometry for DFlash2 drafts with per-layer rotary selection."""
 
 from dataclasses import dataclass
 import json
@@ -52,9 +52,15 @@ class DFlash2Config:
                      "num_key_value_heads", "head_dim", "sliding_window"):
             if type(text.get(name)) is not int or text[name] <= 0:
                 raise ValueError(f"DFlash2 requires a positive {name}")
-        if (text["num_attention_heads"] % text["num_key_value_heads"]
-                or text.get("layer_types") != ["sliding_attention"] * text["num_hidden_layers"]):
-            raise ValueError("DFlash2 requires grouped-query sliding attention in every layer")
+        kinds = text.get("layer_types")
+        if (text["num_attention_heads"] % text["num_key_value_heads"] or not isinstance(kinds, list)
+                or len(kinds) != text["num_hidden_layers"]
+                or any(kind not in ("sliding_attention", "full_attention") for kind in kinds)):
+            raise ValueError("DFlash2 requires grouped-query sliding or full attention in every layer")
+        nope = text.get("no_rope_layers", [])
+        if (not isinstance(nope, list) or nope != sorted(set(nope))
+                or any(type(index) is not int or not 0 <= index < len(kinds) for index in nope)):
+            raise ValueError("DFlash2 NoPE layers must be distinct ordered draft layer indices")
         rope = text.get("rope_parameters", {})
         if (rope.get("rope_type") != "default" or float(rope.get("rope_theta", 0)) <= 0
                 or float(text.get("rms_norm_eps", 0)) <= 0):
@@ -76,6 +82,28 @@ class DFlash2Config:
     @property
     def layers(self):
         return self.text["num_hidden_layers"]
+
+    @property
+    def rotary_layers(self):
+        """Per draft layer: whether its queries and context keys take rotary embeddings."""
+        nope = set(self.text.get("no_rope_layers", ()))
+        return tuple(index not in nope for index in range(self.layers))
+
+    @property
+    def full_attention_layers(self):
+        """Draft layers declared as full attention.
+
+        Every layer reads the same accepted-context ring of `sliding_window`
+        tokens, so a full-attention layer sees exact context up to that length
+        and the most recent window beyond it. This bounds proposal quality on
+        long contexts, never target correctness.
+        """
+        return tuple(index for index, kind in enumerate(self.text["layer_types"]) if kind == "full_attention")
+
+    @property
+    def convolution(self):
+        options = self.text["dflash_config"]
+        return options.get("conv_kernel_size", 2), options.get("conv_group_size", 16)
 
     @property
     def target_layers(self):

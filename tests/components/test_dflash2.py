@@ -17,7 +17,7 @@ from ignition.preparation.scratch import GraphBufferPool
 
 @pytest.mark.parametrize('world', [1, 2, 4, 8])
 def test_non_square_attention_scratch_and_proposal_views(world):
-    config = SimpleNamespace(block_size=8,
+    config = SimpleNamespace(block_size=8, convolution=(2, 16),
         text=dict(hidden_size=5120, intermediate_size=12288, vocab_size=128),
         attention=DraftAttentionGeometry(32, 8, 128, 128, 128, 10000000., 2048))
     buffers = GraphBufferPool('meta').cursor()
@@ -40,7 +40,7 @@ def test_non_square_attention_scratch_and_proposal_views(world):
 
 @pytest.mark.parametrize("width", [8, 13, 16])
 def test_effective_block_preserves_checkpoint_and_scratch_fields(width):
-    config = SimpleNamespace(block_size=8,
+    config = SimpleNamespace(block_size=8, convolution=(2, 16),
         text=dict(hidden_size=5120, intermediate_size=17408, vocab_size=128),
         attention=DraftAttentionGeometry(32, 8, 128, 128, 128, 10000000., 2048))
     scratch = DraftScratch.allocate(config, TensorParallelShard(0, 1), width, "meta",
@@ -79,3 +79,15 @@ def test_checkpoint_geometry_drives_shared_context_storage(model, world):
     with pytest.raises(ValueError, match="does not match the target"):
         DFlash2Config.from_dict(text, target_hidden=hidden, target_vocabulary=248320,
             target_layers=layers + 1, expected=profile)
+
+
+@pytest.mark.parametrize("convolution,width", [((2, 16), 1280), ((4, 16), 2560), ((4, 32), 1280)])
+def test_convolution_coefficients_follow_checkpoint_taps_and_groups(convolution, width):
+    config = SimpleNamespace(block_size=16, convolution=convolution,
+        text=dict(hidden_size=5120, intermediate_size=40960, vocab_size=128),
+        attention=DraftAttentionGeometry(80, 8, 128, 128, 128, 10000., 4096))
+    scratch = DraftScratch.allocate(config, TensorParallelShard(0, 2), 32, "meta",
+                                    buffers=GraphBufferPool("meta").cursor())
+    # Two grouped convolutions per layer, each with one coefficient per tap and channel group.
+    assert scratch.convolution["coefficients"].shape == (32, width)
+    assert scratch.convolution["before"].shape == scratch.convolution["after"].shape == (32, 5120)
