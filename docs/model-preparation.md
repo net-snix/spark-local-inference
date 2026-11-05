@@ -1156,7 +1156,10 @@ flare run PACKAGE --gpus 0
 
 On one RTX PRO 6000 that leaves about 68,000 KV tokens (about 50,000 per request).
 Weight-only GEMMs keep decode near the two-GPU BF16 package, but prefill runs at
-about 1,000 tokens per second.
+about 1,000 tokens per second. Prefill stays weight-only on purpose: quantizing
+the prompt positions' activations to MXFP8 as well raised the KL of the 1,024
+tokens decoded after a 1,024-token prompt from 0.00317 to 0.00486 (worse on 111
+of 120 test sequences), and MXFP8 activations everywhere reach 0.00875.
 
 ## Storage and graph capacities
 
