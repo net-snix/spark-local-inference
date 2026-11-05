@@ -341,6 +341,7 @@ enum ToolParserKind {
   MINIMAX_XML = 5;
   GEMMA_CALL = 6;
   ATEM = 7;
+  HERMES_JSON = 8;
 }
 enum ReasoningParserKind {
   REASONING_PARSER_UNSPECIFIED = 0;

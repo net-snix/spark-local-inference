@@ -31,6 +31,9 @@ pub struct OutputConfig {
 pub trait ToolDialect {
     const NAME: &'static str;
     const TRIM_NEWLINES: bool;
+    /// Template text between content and the first call when `TRIM_NEWLINES` is set;
+    /// later calls follow one newline.
+    const FIRST_CALL_SEPARATOR: &'static str = "\n\n";
     const OPEN: &'static str;
     const CLOSE: &'static str;
     const FUNCTION: Option<(&'static str, &'static str)> = None;
@@ -660,7 +663,7 @@ impl<D: ToolDialect> TaggedOutput<D> {
                         let prefix = &self.buffer[..at];
                         let prefix = if tool && D::TRIM_NEWLINES {
                             if self.calls == 0 {
-                                prefix.strip_suffix("\n\n").unwrap_or(prefix)
+                                prefix.strip_suffix(D::FIRST_CALL_SEPARATOR).unwrap_or(prefix)
                             } else {
                                 prefix.strip_suffix('\n').unwrap_or(prefix)
                             }

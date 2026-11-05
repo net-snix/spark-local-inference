@@ -747,6 +747,11 @@ mod tests {
                 ToolParserKind::Dsml,
                 "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\"></｜DSML｜invoke></｜DSML｜tool_calls>",
             ),
+            (
+                8,
+                ToolParserKind::HermesJson,
+                "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {}}\n</tool_call>",
+            ),
         ] {
             let tool = wire::ToolParser::decode(&[0x08, kind][..]).unwrap();
             let reason =

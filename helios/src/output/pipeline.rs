@@ -33,6 +33,7 @@ pub enum OutputPipeline {
     Recipient(super::recipient::RecipientOutput),
     MiniMaxXml(TaggedOutput<super::minimax_xml::MiniMaxXml>),
     GemmaCall(TaggedOutput<super::gemma_call::GemmaCall>),
+    HermesJson(TaggedOutput<super::hermes_json::HermesJson>),
     Text(TaggedOutput<PlainText>),
 }
 
@@ -59,6 +60,7 @@ macro_rules! dispatch {
             OutputPipeline::Recipient($parser) => $body,
             OutputPipeline::MiniMaxXml($parser) => $body,
             OutputPipeline::GemmaCall($parser) => $body,
+            OutputPipeline::HermesJson($parser) => $body,
             OutputPipeline::Text($parser) => $body,
         }
     };
@@ -99,6 +101,9 @@ impl OutputPipeline {
             Some((ToolParserKind::GemmaCall, _, _)) => Self::GemmaCall(
                 TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
             ),
+            Some((ToolParserKind::HermesJson, _, _)) => Self::HermesJson(
+                TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
+            ),
             None => Self::Text(
                 TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
             ),
@@ -115,7 +120,8 @@ impl OutputPipeline {
                 | ToolParserKind::QwenCoder
                 | ToolParserKind::GlmArgumentTags
                 | ToolParserKind::MiniMaxXml
-                | ToolParserKind::GemmaCall,
+                | ToolParserKind::GemmaCall
+                | ToolParserKind::HermesJson,
             )
             | None => true,
         }
@@ -173,6 +179,9 @@ impl OutputPipeline {
             }
             Some((ToolParserKind::GemmaCall, _, _)) => {
                 TaggedOutput::<super::gemma_call::GemmaCall>::grammar_envelope(&config.content)
+            }
+            Some((ToolParserKind::HermesJson, _, _)) => {
+                TaggedOutput::<super::hermes_json::HermesJson>::grammar_envelope(&config.content)
             }
             None => Some(crate::grammar::OutputEnvelope {
                 recipient: None,

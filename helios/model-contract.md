@@ -220,7 +220,9 @@ cannot publish a successful checkpoint.
 Tool parsers, reasoning parsers, image preparation, and image layouts each have
 an independent enum selector. Implementations are reusable syntax or image
 algorithms, not model identities. Qwen Coder function tags, GLM argument tags,
-and DSML tool syntax may be paired independently with think-tag reasoning.
+Hermes JSON calls, and DSML tool syntax may be paired independently with
+think-tag reasoning. A Hermes JSON call is one `{"name": ..., "arguments": ...}`
+object per `<tool_call>` block; string arguments must encode a JSON object.
 Wrapping newlines, tag separators, assistant boundaries, and reasoning terminal
 markers are explicit syntax data. A reasoning terminal marker must be the
 declared tool syntax's opener. Reasoning delimiters that the frontend tokenizer
