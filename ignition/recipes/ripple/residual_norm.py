@@ -10,12 +10,13 @@ row reproduces that arithmetic bit for bit: it sums the squares in the exact ord
 factor, and repeats Inductor's pointwise rounding (BF16 normalized value, BF16 weight product,
 BF16 residual sum, FMA lerp).
 
-ATen order for one output row (Reduce.cuh, vectorized input of four, 512-thread blocks): a block
-of BW = 512 / min(floor_pow2(rows), 16) lanes reads the row as float4 chunks; lane t keeps four
-accumulators, accumulator i summing elements 4 (t + BW k) + i over k in order. The four combine
-as ((a0 + a1) + a2) + a3, shared memory halves the lanes down to a warp (lane t adds lane
-t + BW / 2, ...), and shuffle-down by 1, 2, 4, 8, 16 finishes in lane 0. FP32 addition is
-commutative, so each pairwise step is one exactly reproduced addition.
+ATen order for one output row (torch 2.14 Reduce.cuh, vectorized input of four, 512-thread
+blocks): a block of BW = 512 / min(floor_pow2(rows), 16) lanes reads the row as float4 chunks;
+lane t keeps four accumulators, accumulator i summing elements 4 (t + BW k) + i over k in order.
+The four combine as ((a0 + a1) + a2) + a3. Shared memory then halves the lanes down to a warp
+(lane t adds lane t + W / 2) and shuffle-down by 16, 8, 4, 2, 1 (decreasing on CUDA) halves the
+rest, so every step adds lane t + W / 2 to lane t. FP32 addition is commutative, so each step
+is one exactly reproduced addition.
 """
 
 import torch
@@ -54,6 +55,7 @@ def _square_sum(row, VECTORS: tl.constexpr, BW: tl.constexpr):
         a2 = a2 + x2 * x2
         a3 = a3 + x3 * x3
     total = ((a0 + a1) + a2) + a3
+    # Lane t adds lane t + W / 2 until one lane remains.
     if BW >= 512:
         total = tl.sum(tl.reshape(total, [2, 256]), axis=0)
     if BW >= 256:
@@ -62,10 +64,10 @@ def _square_sum(row, VECTORS: tl.constexpr, BW: tl.constexpr):
         total = tl.sum(tl.reshape(total, [2, 64]), axis=0)
     if BW >= 64:
         total = tl.sum(tl.reshape(total, [2, 32]), axis=0)
-    total = tl.sum(tl.reshape(total, [16, 2]), axis=1)
-    total = tl.sum(tl.reshape(total, [8, 2]), axis=1)
-    total = tl.sum(tl.reshape(total, [4, 2]), axis=1)
-    total = tl.sum(tl.reshape(total, [2, 2]), axis=1)
+    total = tl.sum(tl.reshape(total, [2, 16]), axis=0)
+    total = tl.sum(tl.reshape(total, [2, 8]), axis=0)
+    total = tl.sum(tl.reshape(total, [2, 4]), axis=0)
+    total = tl.sum(tl.reshape(total, [2, 2]), axis=0)
     return tl.sum(total, axis=0)
 
 
