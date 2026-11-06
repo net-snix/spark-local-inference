@@ -40,6 +40,11 @@ def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tenso
     return x * cos[:, None, :] + rotated * sin[:, None, :]
 
 
+def _reduced(reduction: PreparedAllReduce, partial: torch.Tensor) -> torch.Tensor:
+    # Traced forwards test the flag, never the runtime (see PreparedAllReduce).
+    return partial if reduction.single else reduction(partial)
+
+
 @dataclass(frozen=True)
 class Scratch:
     activations: torch.Tensor
@@ -91,18 +96,23 @@ class PreparedLayer:
             return prepare_projection(inputs, weight, output, session=session, name=f"{name}.{field}",
                                       workspace=workspace, activation_mode=activation_mode)
 
-        self.normed = source
-        self.value_input = zeros((tokens, config.hidden))
+        # Projections read their BF16 rows from the forward's own temporaries. A copy into these
+        # prepared buffers lowers to an opaque memcpy node per layer (a partial arena region
+        # cannot fuse into its producer), so the buffers only shape and tune the projections.
+        self.normed = self.value_input = source
         self.qgk_out = zeros((tokens, 2 * self.q_width + self.k_width))
         self.v_out = zeros((tokens, self.k_width))
         self.q = zeros((tokens, self.heads, self.dim))
         self.key = zeros((tokens, self.kv_heads, self.dim))
         self.value = zeros((tokens, self.kv_heads, self.dim))
         self.attended = zeros((tokens, self.q_width))
-        self.attn_partial, self.attn_out = zeros((tokens, config.hidden)), zeros((tokens, config.hidden))
+        self.attn_partial = zeros((tokens, config.hidden))
+        # A single rank's reduction is the identity: its partial is already the sum.
+        self.attn_out = self.attn_partial if runtime is None else zeros((tokens, config.hidden))
         self.gate_up_out = zeros((tokens, 2 * self.inter))
         self.activation = zeros((tokens, self.inter))
-        self.mlp_partial, self.mlp_out = zeros((tokens, config.hidden)), zeros((tokens, config.hidden))
+        self.mlp_partial = zeros((tokens, config.hidden))
+        self.mlp_out = self.mlp_partial if runtime is None else zeros((tokens, config.hidden))
         self.blend = torch.sigmoid(weights["value_blend"][0])
         self.qgk = projection(source, weights["qgk"], self.qgk_out, "qgk")
         self.v_proj = projection(self.value_input, weights["v_proj"], self.v_out, "v_proj")
@@ -130,10 +140,9 @@ class PreparedLayer:
 
     def __call__(self, hidden, value_residual, cos, sin):
         w, eps, tokens = self.weights, self.eps, hidden.shape[0]
-        self.normed.copy_(rms_norm(hidden, w["input_layernorm"], eps))
-        self.qgk(self.normed)
-        self.value_input.copy_(torch.lerp(value_residual, self.normed, self.blend))
-        self.v_proj(self.value_input)
+        normed = rms_norm(hidden, w["input_layernorm"], eps)
+        self.qgk(normed)
+        self.v_proj(torch.lerp(value_residual, normed, self.blend))
         q = rms_norm(self.qgk_out[:, :self.q_width].view(tokens, self.heads, self.dim), w["q_norm"], eps)
         k = rms_norm(self.qgk_out[:, 2 * self.q_width:].view(tokens, self.kv_heads, self.dim), w["k_norm"], eps)
         if self.is_sliding:
@@ -148,17 +157,15 @@ class PreparedLayer:
         if self.window is not None:
             self.window.commit()
         gate = torch.sigmoid(self.qgk_out[:, self.q_width:2 * self.q_width].float()).to(hidden.dtype)
-        self.attended.mul_(gate)
-        attn = self.attn_reduce(self.o_proj(self.attended))
+        attn = _reduced(self.attn_reduce, self.o_proj(self.attended * gate))
         hidden = hidden + rms_norm(attn, w["post_attention_layernorm"], eps)
 
-        self.normed.copy_(rms_norm(hidden, w["pre_feedforward_layernorm"], eps))
-        self.gate_up(self.normed)
+        normed = rms_norm(hidden, w["pre_feedforward_layernorm"], eps)
+        self.gate_up(normed)
         gate, up = self.gate_up_out[:, :self.inter], self.gate_up_out[:, self.inter:]
         if self.clamp is not None:
             gate, up = gate.clamp(max=self.clamp), up.clamp(min=-self.clamp, max=self.clamp)
-        self.activation.copy_(F.silu(gate) * up)
-        mlp = self.mlp_reduce(self.down(self.activation))
+        mlp = _reduced(self.mlp_reduce, self.down(F.silu(gate) * up))
         return hidden + rms_norm(mlp, w["post_feedforward_layernorm"], eps)
 
 
