@@ -25,6 +25,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
 from .config import PAGE_TOKENS
+from .residual_norm import MAX_ROWS, residual_norm as fused_residual_norm
 from .window import WindowMetadata
 
 
@@ -38,6 +39,20 @@ def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tenso
     left, right = x.chunk(2, dim=-1)
     rotated = torch.cat((-right, left), dim=-1)
     return x * cos[:, None, :] + rotated * sin[:, None, :]
+
+
+def staged_residual_norm(delta, hidden, post_weight, weight, eps, *, start=None, blend=None):
+    """`hidden + rms_norm(delta, post_weight)` (with a delta), its `rms_norm(., weight)` and value lerp."""
+    if delta is not None:
+        hidden = hidden + rms_norm(delta, post_weight, eps)
+    normed = rms_norm(hidden, weight, eps)
+    return hidden, normed, None if start is None else torch.lerp(start, normed, blend)
+
+
+def residual_norm(delta, hidden, post_weight, weight, eps, *, start=None, blend=None):
+    # Decode-sized rows run one fused, bit-identical kernel; prefill keeps the staged Inductor chain.
+    norm = fused_residual_norm if hidden.is_cuda and hidden.shape[0] <= MAX_ROWS else staged_residual_norm
+    return norm(delta, hidden, post_weight, weight, eps, start=start, blend=blend)
 
 
 def _reduced(reduction: PreparedAllReduce, partial: torch.Tensor) -> torch.Tensor:
@@ -114,6 +129,8 @@ class PreparedLayer:
         self.mlp_partial = zeros((tokens, config.hidden))
         self.mlp_out = self.mlp_partial if runtime is None else zeros((tokens, config.hidden))
         self.blend = torch.sigmoid(weights["value_blend"][0])
+        # The norm after this layer: the next layer's input norm and value blend, or the final norm.
+        self.following = None
         self.qgk = projection(source, weights["qgk"], self.qgk_out, "qgk")
         self.v_proj = projection(self.value_input, weights["v_proj"], self.v_out, "v_proj")
         self.o_proj = projection(self.attended, weights["o_proj"], self.attn_partial, "o_proj")
@@ -138,11 +155,12 @@ class PreparedLayer:
             mode=mode, window=config.sliding_window - 1 if self.is_sliding else -1, width=width,
             session=session, name=f"{name}.attention", workspace=workspace, tuning_page_count=tuning_pages)
 
-    def __call__(self, hidden, value_residual, cos, sin):
+    def __call__(self, hidden, normed, value_input, value_residual, cos, sin):
+        """One layer from its normalized input rows; returns the residual stream and the following norm's
+        rows (with the next layer's value lerp, or None after the last layer)."""
         w, eps, tokens = self.weights, self.eps, hidden.shape[0]
-        normed = rms_norm(hidden, w["input_layernorm"], eps)
         self.qgk(normed)
-        self.v_proj(torch.lerp(value_residual, normed, self.blend))
+        self.v_proj(value_input)
         q = rms_norm(self.qgk_out[:, :self.q_width].view(tokens, self.heads, self.dim), w["q_norm"], eps)
         k = rms_norm(self.qgk_out[:, 2 * self.q_width:].view(tokens, self.kv_heads, self.dim), w["k_norm"], eps)
         if self.is_sliding:
@@ -158,15 +176,16 @@ class PreparedLayer:
             self.window.commit()
         gate = torch.sigmoid(self.qgk_out[:, self.q_width:2 * self.q_width].float()).to(hidden.dtype)
         attn = _reduced(self.attn_reduce, self.o_proj(self.attended * gate))
-        hidden = hidden + rms_norm(attn, w["post_attention_layernorm"], eps)
-
-        normed = rms_norm(hidden, w["pre_feedforward_layernorm"], eps)
+        hidden, normed, _ = residual_norm(attn, hidden, w["post_attention_layernorm"],
+                                          w["pre_feedforward_layernorm"], eps)
         self.gate_up(normed)
         gate, up = self.gate_up_out[:, :self.inter], self.gate_up_out[:, self.inter:]
         if self.clamp is not None:
             gate, up = gate.clamp(max=self.clamp), up.clamp(min=-self.clamp, max=self.clamp)
         mlp = _reduced(self.mlp_reduce, self.down(F.silu(gate) * up))
-        return hidden + rms_norm(mlp, w["post_feedforward_layernorm"], eps)
+        weight, blend = self.following
+        return residual_norm(mlp, hidden, w["post_feedforward_layernorm"], weight, eps,
+                             start=None if blend is None else value_residual, blend=blend)
 
 
 class PreparedDecoder:
@@ -188,6 +207,9 @@ class PreparedDecoder:
                                      buffers=layer_buffers.cursor(), cache_metadata=self.cache_metadata,
                                      windows=self.windows)
                        for index, layer_weights in enumerate(weights.layers)]
+        for layer, following in zip(self.layers, self.layers[1:]):
+            layer.following = following.weights["input_layernorm"], following.blend
+        self.layers[-1].following = weights.norm, None
         self.scoring = None if scoring is None else scoring.prepare(scratch.normalized, weights.head,
             vocabulary=config.vocabulary, session=session, coordinator=coordinator, name=name + ".prompt")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
@@ -215,14 +237,18 @@ class PreparedDecoder:
         embedded = self.embedding()
         scale = self.config.embed_scale
         self.scratch.residual.copy_(embedded if scale is None else embedded * scale)
-        hidden = self.scratch.residual
+        hidden = residual = self.scratch.residual
         if self.context_capture is not None:
             self.context_capture.begin()
+        first = self.layers[0]
+        _, normed, value_input = residual_norm(None, hidden, None, first.weights["input_layernorm"], self.eps,
+                                               start=residual, blend=first.blend)
         for index, layer in enumerate(self.layers):
-            hidden = layer(hidden, self.scratch.residual, cos, sin)
+            hidden, normed, value_input = layer(hidden, normed, value_input, residual, cos, sin)
             if index in self.taps:
                 self.context_capture(hidden, self.taps.index(index) * hidden.shape[-1])
-        self.scratch.normalized.copy_(rms_norm(hidden, self.weights.norm, self.eps))
+        # After the last layer, `normed` is the final norm.
+        self.scratch.normalized.copy_(normed)
         if self.scoring is not None:
             for source, projection, reduction in self.scoring.parts:
                 projection(source)

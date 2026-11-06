@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from ignition.recipes.ripple.decoder import PreparedLayer, rms_norm, rotate
+from ignition.recipes.ripple.decoder import PreparedLayer, rms_norm, rotate, staged_residual_norm
 
 TOKENS, HIDDEN, HEADS, KV_HEADS, DIM, INTER, EPS = 3, 32, 2, 1, 8, 24, 1e-6
 
@@ -37,6 +37,8 @@ def _layer(generator, clamp):
     layer.weights = {name: _bf16(HIDDEN, generator=generator) for name in norms}
     layer.weights.update(q_norm=_bf16(DIM, generator=generator), k_norm=_bf16(DIM, generator=generator))
     layer.blend = torch.sigmoid(torch.tensor(0.3)).bfloat16()
+    # The next layer's input norm and value blend.
+    layer.following = _bf16(HIDDEN, generator=generator), torch.sigmoid(torch.tensor(-0.2)).bfloat16()
 
     def zeros(*shape):
         return torch.zeros(*shape, dtype=torch.bfloat16)
@@ -68,6 +70,7 @@ def _layer(generator, clamp):
 def _reference(layer, hidden, value_residual, cos, sin):
     """The staged arithmetic the layer had before it fed temporaries to its projections."""
     w, m, q_width = layer.weights, layer.matrices, layer.q_width
+    following, blend = layer.following
 
     def linear(source, weight):
         return (source.float() @ weight.float().t()).to(source.dtype)
@@ -86,7 +89,9 @@ def _reference(layer, hidden, value_residual, cos, sin):
     if layer.clamp is not None:
         gate, up = gate.clamp(max=layer.clamp), up.clamp(min=-layer.clamp, max=layer.clamp)
     mlp = linear(F.silu(gate) * up, m["down"])
-    return hidden + rms_norm(mlp, w["post_feedforward_layernorm"], EPS)
+    hidden = hidden + rms_norm(mlp, w["post_feedforward_layernorm"], EPS)
+    normed = rms_norm(hidden, following, EPS)
+    return hidden, normed, torch.lerp(value_residual, normed, blend)
 
 
 def test_layer_projections_read_forward_temporaries():
@@ -98,5 +103,8 @@ def test_layer_projections_read_forward_temporaries():
         table = torch.cat((angles, angles), dim=-1)
         cos, sin = table.cos().bfloat16().float(), table.sin().bfloat16().float()
         expected = _reference(layer, hidden, value_residual, cos, sin)
-        assert torch.equal(layer(hidden, value_residual, cos, sin), expected)
+        _, normed, value_input = staged_residual_norm(None, hidden, None, layer.weights["input_layernorm"], EPS,
+                                                      start=value_residual, blend=layer.blend)
+        actual = layer(hidden, normed, value_input, value_residual, cos, sin)
+        assert all(torch.equal(got, want) for got, want in zip(actual, expected, strict=True))
         assert not layer.normed.any()
