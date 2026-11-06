@@ -50,8 +50,9 @@ from ignition.progress import phase
 from .config import PAGE_TOKENS
 from .contract import prepare as prepare_contract
 from .decoder import PreparedDecoder, Scratch
-from .pool import ContinuationPool, continuation_layout, page_bytes
+from .pool import KV_DTYPES, ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
+from .window import WindowStaging
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = (1,)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
+    kv_dtype: str = "bfloat16"
 
     def __post_init__(self):
         if self.devices is not None and (not isinstance(self.devices, tuple) or len(self.devices) not in (1, 2, 4)
@@ -96,6 +98,8 @@ class PreparationConfig:
             raise ValueError("minimum page capacity must be a positive integer")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
+        if self.kv_dtype not in {str(dtype).removeprefix("torch.") for dtype in KV_DTYPES}:
+            raise ValueError("Ripple KV must be bfloat16 or float8_e4m3fn")
         if type(self.mtp) is not bool or type(self.online_mxfp8) is not bool:
             raise TypeError("DFlash2 and MXFP8 selections must be booleans")
         if self.mtp and self.draft_snapshot is None:
@@ -157,7 +161,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     context = min(config.context, weights.config.text["max_position_embeddings"]) // PAGE_TOKENS * PAGE_TOKENS
     if config.prefill_chunk_size > context:
         raise ValueError("Ripple prefill chunk size exceeds the prepared context")
-    layout = continuation_layout(weights.config, shard, draft=config.mtp)
+    kv_dtype = getattr(torch, config.kv_dtype)
+    layout = continuation_layout(weights.config, shard, draft=config.mtp, kv_dtype=kv_dtype)
     snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
     if package_storage is None:
         snapshots = min(snapshots, 256)
@@ -169,14 +174,16 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     prep_pages = config.prefill_chunk_size // PAGE_TOKENS + 2 * slots
     pages = max(prep_pages, config.minimum_pages)
     initial_pages = prep_pages if package_storage is not None else pages
-    bytes_per_page = page_bytes(weights.config, shard)
+    bytes_per_page = page_bytes(weights.config, shard, kv_dtype)
     total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
     with phase(progress, "Allocate model state"):
         pool = ContinuationPool.for_model(weights.config, state_rows + 1, initial_pages, device, shard=shard,
-            draft=config.mtp,
+            draft=config.mtp, kv_dtype=kv_dtype,
             storage=package_storage, maximum_pages=max(pages, total_memory // bytes_per_page),
             maximum_rows=total_memory // layout.row_bytes,
             backed_slots=min(state_rows + 1, 1 + 2 * slots) if package_storage is not None else None)
+        # Every prefill graph stages its chunk's sliding window in these pages, one layer at a time.
+        staging = WindowStaging.allocate(weights.config, shard, config.prefill_chunk_size, device, kv_dtype=kv_dtype)
         vocabulary = weights.config.vocabulary
         requests = DeviceRequestState.allocate(device, vocab_size=vocabulary, capacity=slots)
         inputs = BatchInputs.allocate(tokens, blocks, device, capacity=slots)
@@ -208,6 +215,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
                 gather_collective = create_all_gather_runtime(group, device,
                     max_rows=max(verify_tokens, draft_rows, min(config.prefill_chunk_size, window)),
                     columns=weights.config.hidden, ipc=ipc)
+        # The identity names the tuning namespace, so the KV layout stays out of it: kernels whose shapes
+        # are unchanged keep their tuned plans. The runtime fingerprints the cache geometry separately.
         identity = hashlib.sha256(json.dumps({
             "config": weights.config.text, "headers": [s.header_sha256 for s in manifest.shards],
             "world_size": shard.world_size, "contract": "ripple.graph-inputs.v1",
@@ -280,7 +289,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
                         scratch = Scratch.allocate(capacity, rows, weights.config, scratch_buffers.cursor(),
                                                    shard=shard)
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
-                        scoring=scoring if kind == "scored_prefill" else None, buffers=cursor,
+                        scoring=scoring if kind == "scored_prefill" else None, buffers=cursor, staging=staging,
                         runtime=prefill_collective if mode == "prefill" and capacity >= 1024 else collective,
                         vocabulary_runtime=vocabulary_collective, coordinator=coordinator, session=session,
                         name=name, workspace=arena, layer_buffers=layer_buffers)
@@ -373,6 +382,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
         preparation_state_rows=int(pool.memory_capacity[0].item()),
         preparation_state_bytes=int(pool.memory_capacity[0].item()) * layout.row_bytes, row_bytes=layout.row_bytes,
         pages=pages, page_bytes=bytes_per_page, page_tokens=PAGE_TOKENS, kv_bytes=pages * bytes_per_page,
+        kv_dtype=config.kv_dtype, ring_pages=pool.ring_pages, window_staging_bytes=staging.key.nbytes * 2,
         completion_output_bytes=completion.nbytes, operator_scratch_bytes=arena.nbytes, graphs=len(graphs),
         prefill_capacities=prefill_sizes, free_device_bytes=free, total_device_bytes=total,
         headroom_bytes=config.headroom_bytes, tuning=tuning, compiled_decoder=config.compile_decoder,
@@ -392,7 +402,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
         device=device_id, graphs=graphs, buffers=buffers, signatures=signatures, max_active=config.max_active,
         session=session, server_config=server_config, memory_report=memory, close_resources=tuple(close_resources),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
-            *storage_ranges([arena.tensor, metadata, *[chunk for p in (scratch_buffers, graph_buffers, layer_buffers,
+            *storage_ranges([arena.tensor, metadata, staging.key, staging.value, *[chunk for p in (scratch_buffers, graph_buffers, layer_buffers,
                                                                 target_buffers, context_buffers, draft_buffers)
                                                      for chunks in p.chunks.values() for chunk in chunks],
                              () if speculation is None else speculation.draft_scratch.scratch_tensors(),
@@ -401,7 +411,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, scratch_buffers,
                    graph_buffers, layer_buffers, metadata, compiled, stream, graph_pool, session, coordinator,
                    collective, prefill_collective, vocabulary_collective, gather_collective, scratch_pool,
-                   target_buffers, context_buffers, draft_buffers, speculation))
+                   target_buffers, context_buffers, draft_buffers, speculation, staging))
 
 
 def prepare(snapshot, config, *, progress=None, package_storage):

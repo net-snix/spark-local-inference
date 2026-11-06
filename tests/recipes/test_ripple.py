@@ -199,13 +199,17 @@ def test_pages_and_state_rows_match_declared_costs(drafted, world, drafting):
     costs = recipe.costs(world, recipe.speculation if drafting else None)
     layout = continuation_layout(drafted, shard, draft=drafting)
     assert layout.row_bytes == costs.state_row_bytes
-    assert page_bytes(drafted, shard) == costs.page_bytes == 80 * 2 * 128 * (8 // world) * 128 * 2
+    assert page_bytes(drafted, shard) == costs.page_bytes == 16 * 2 * 128 * (8 // world) * 128 * 2
     pool = ContinuationPool.for_model(drafted, 3, 2, "meta", shard=shard, draft=drafting)
     assert pool.layout.row_bytes == costs.state_row_bytes
-    assert len(pool.pages) == 160 and sum(page[0].nbytes for page in pool.pages.values()) == costs.page_bytes
+    assert len(pool.pages) == 32 and sum(page[0].nbytes for page in pool.pages.values()) == costs.page_bytes
+    assert pool.kv_dtype == KV_DTYPE and pool.ring_pages == (10 if drafting else 9)
     for layer in (0, 4, 79):
         for cache in pool.attention(layer, drafted, shard):
             assert cache.dtype == KV_DTYPE and cache.shape[1:] == (128, 8 // world, 128)
+    rows = pool.row_pages(drafted, shard)
+    assert pool.attention(0, drafted, shard)[0].shape[0] == 2 * rows + pool.ring_pages
+    assert pool.attention(4, drafted, shard)[0].shape[0] == 2
     rings = [region for region in layout.regions if region.name.startswith("draft")]
     assert len(rings) == (10 if drafting else 0)
     for region in rings:
@@ -215,12 +219,123 @@ def test_pages_and_state_rows_match_declared_costs(drafted, world, drafting):
     assert pool.reserved_region("consumed_tokens").dtype == torch.int64
 
 
-def test_draft_costs_only_add_rings():
+def test_draft_costs_add_rings_and_a_ring_page():
     recipe = MODEL.recipe
     for world in (1, 2, 4):
         plain, drafting = recipe.costs(world, None), recipe.costs(world, recipe.speculation)
         assert drafting.page_bytes == plain.page_bytes and drafting.graph_bytes == plain.graph_bytes
-        assert drafting.state_row_bytes - plain.state_row_bytes == 5 * 2 * 4096 * (8 // world) * 128
+        record = 128 * (8 // world) * 128 * 2
+        # Sixteen-token rounds keep one more ring page per sliding layer than single tokens.
+        assert drafting.state_row_bytes - plain.state_row_bytes == 5 * 2 * 4096 * (8 // world) * 128 + 128 * record
+
+
+def test_window_pages_bound_every_round(target):
+    from ignition.recipes.ripple.pool import window_pages
+
+    assert [window_pages(target, width) for width in (1, 16, 128, 2048, 4096)] == [9, 10, 10, 25, 41]
+    for width in (1, 2, 15, 16, 17, 128, 1536, 2048):
+        touched = max((first + width - 1) // 128 - max(first - 1023, 0) // 128 + 1 for first in range(0, 4096))
+        assert touched <= window_pages(target, width)
+        assert any((first + width - 1) // 128 - (first - 1023) // 128 + 1 == window_pages(target, width)
+                   for first in range(1023, 4096))
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_fp8_kv_costs_match_the_layout(drafted, kv_dtype):
+    from ignition.recipes.ripple.pool import continuation_layout, page_bytes
+
+    checkpoint = next(c for c in MODEL.recipe.checkpoints if c.alias == "ripple-65b-mxfp8-fp8kv")
+    assert checkpoint.repository == mxfp8_checkpoint().repository and checkpoint.revision == mxfp8_checkpoint().revision
+    for world in (1, 2, 4):
+        shard = TensorParallelShard(0, world)
+        for drafting in (False, True):
+            costs = MODEL.recipe.costs(world, MODEL.recipe.speculation if drafting else None,
+                                       checkpoint if kv_dtype == torch.float8_e4m3fn else None)
+            assert continuation_layout(drafted, shard, draft=drafting, kv_dtype=kv_dtype).row_bytes == costs.state_row_bytes
+            assert page_bytes(drafted, shard, kv_dtype) == costs.page_bytes
+
+
+class _Buffers:
+    def zeros(self, shape, dtype):
+        return torch.zeros(shape, dtype=dtype)
+
+
+def _ring_reads_match_history(window, metadata, history, *, key):
+    """Every position each live query reads under the window holds its latest written value."""
+    m = metadata
+    for token in range(m.positions.numel()):
+        query = int(m.positions[token])
+        if query < 0:
+            continue
+        request = int(m.requests[token])
+        for position in range(max(query - 1023, 0), query + 1):
+            page = int(window.table[request, position // 128])
+            assert key.view(torch.int16)[page, position % 128, 0, 0].item() == history[request][position], (
+                query, position)
+
+
+def _write(window, metadata, key, values):
+    for token, slot in enumerate(window.slots.tolist()):
+        if slot >= 0:
+            key.view(torch.int16)[slot // 128, slot % 128] = values[token]
+
+
+def test_rings_and_staged_prefill_read_exact_window_history(drafted):
+    from ignition.components.paged_batch import Metadata
+    from ignition.recipes.ripple.pool import ContinuationPool
+    from ignition.recipes.ripple.window import WindowMetadata, WindowStaging
+
+    shard = TensorParallelShard(3, 4)
+    pool = ContinuationPool.for_model(drafted, 4, 2, "cpu", shard=shard, draft=True)
+    blocks, chunk, width = 64, 512, 16
+    staging = WindowStaging.allocate(drafted, shard, chunk, "cpu", kv_dtype=torch.bfloat16)
+    prefill = Metadata.allocate(chunk, 1, blocks, "cpu")
+    verify = Metadata.allocate(2 * width, 2, blocks, "cpu", max_query_tokens=width)
+    staged = WindowMetadata(prefill, pool, drafted, shard, mode="prefill", buffers=_Buffers(), staging=staging)
+    rings = WindowMetadata(verify, pool, drafted, shard, mode="verify", buffers=_Buffers())
+    layer = rings.layer(0)
+    history = {0: {}, 1: {}}
+    generator = torch.Generator().manual_seed(0)
+
+    def value(position, version):
+        # A distinct bit pattern per position and rewrite.
+        return (position * 160 + version) % 32749 + 1
+
+    # Two requests on rows 1 and 2 prefill different lengths, chunk by chunk, then verify sixteen
+    # positions per round and accept a random prefix.
+    ends = [0, 0]
+    for request, (row, total) in enumerate(((1, 2300), (2, 1100))):
+        while ends[request] < total:
+            length = min(chunk - 64 * request, total - ends[request])
+            tokens = torch.zeros(1, chunk, dtype=torch.int64)
+            prefill.set(torch.tensor([ends[request]]), torch.tensor([length], dtype=torch.int32),
+                        torch.tensor([row]), torch.zeros(1, blocks, dtype=torch.int32), tokens, torch.tensor([1]))
+            staged()
+            window = staged.layer(0)
+            window.gather()
+            values = torch.zeros(chunk, 2, 128, dtype=torch.int16)
+            for token in range(length):
+                position = ends[request] + token
+                values[token] = value(position, 0)
+                history[request][position] = value(position, 0)
+            _write(staged, prefill, window.key, values)
+            _ring_reads_match_history(staged, prefill, {0: history[request]}, key=window.key)
+            window.commit()
+            ends[request] += length
+    for version in range(1, 160):
+        lengths = torch.tensor([width, width], dtype=torch.int32)
+        verify.set(torch.tensor(ends), lengths, torch.tensor([1, 2]), torch.zeros(2, blocks, dtype=torch.int32),
+                   torch.zeros(2, width, dtype=torch.int64), torch.tensor([2]))
+        rings()
+        values = torch.zeros(2 * width, 2, 128, dtype=torch.int16)
+        for token in range(2 * width):
+            request, position = int(verify.requests[token]), int(verify.positions[token])
+            values[token] = value(position, version)
+            history[request][position] = value(position, version)
+        _write(rings, verify, layer.key, values)
+        _ring_reads_match_history(rings, verify, history, key=layer.key)
+        for request in range(2):
+            ends[request] += int(torch.randint(1, width + 1, (), generator=generator))
 
 
 def test_real_draft_config_geometry(target):

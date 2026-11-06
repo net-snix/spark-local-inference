@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prepared Ripple decoder layers over paged BF16 KV and tensor-parallel projections.
+"""Prepared Ripple decoder layers over paged and ring KV and tensor-parallel projections.
 
 Arithmetic follows the checkpoint's `modeling_ricursive.py`: RMSNorm rounds the
 normalized FP32 activation to BF16 before its BF16 weight multiply, RoPE runs in
@@ -25,6 +25,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
 from .config import PAGE_TOKENS
+from .window import WindowMetadata
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -65,7 +66,7 @@ class Scratch:
 
 class PreparedLayer:
     def __init__(self, index, weights, config, source, metadata, pool, *, shard, runtime, coordinator, mode,
-                 session, name, workspace, buffers, cache_metadata):
+                 session, name, workspace, buffers, cache_metadata, windows):
         self.index, self.eps = index, config.rms_norm_eps
         self.is_sliding = config.is_sliding(index)
         self.weights = weights
@@ -112,14 +113,20 @@ class PreparedLayer:
                                              coordinator=coordinator, name=f"{name}.attn_reduce")
         self.mlp_reduce = PreparedAllReduce(self.mlp_partial, self.mlp_out, runtime=runtime, session=session,
                                             coordinator=coordinator, name=f"{name}.mlp_reduce")
-        key_cache, value_cache = pool.attention(index, config, shard=shard)
-        self.writer = PreparedPagedKVWriter(self.key, self.value, key_cache, value_cache, cache_metadata.slots,
+        # Sliding layers write and read their ring, or a prefill chunk's staged window (window.py).
+        self.window = windows.layer(index) if self.is_sliding else None
+        if self.window is None:
+            key_cache, value_cache = pool.attention(index, config, shard=shard)
+            pages, slots, tuning_pages = metadata.page_table, cache_metadata.slots, int(pool.memory_capacity[1].item())
+        else:
+            w = self.window
+            key_cache, value_cache, pages, slots, tuning_pages = w.key, w.value, w.pages, w.slots, w.tuning_page_count
+        self.writer = PreparedPagedKVWriter(self.key, self.value, key_cache, value_cache, slots,
                                             session=session, name=f"{name}.cache_write")
-        self.attention = PreparedPagedAttention(self.q, key_cache, value_cache, metadata.page_table,
+        self.attention = PreparedPagedAttention(self.q, key_cache, value_cache, pages,
             cache_metadata.lengths, metadata.query_start_loc, self.attended.view(tokens, self.heads, self.dim),
             mode=mode, window=config.sliding_window - 1 if self.is_sliding else -1, width=width,
-            session=session, name=f"{name}.attention", workspace=workspace,
-            tuning_page_count=int(pool.memory_capacity[1].item()))
+            session=session, name=f"{name}.attention", workspace=workspace, tuning_page_count=tuning_pages)
 
     def __call__(self, hidden, value_residual, cos, sin):
         w, eps, tokens = self.weights, self.eps, hidden.shape[0]
@@ -134,8 +141,12 @@ class PreparedLayer:
         self.q.copy_(q)
         self.key.copy_(k)
         self.value.copy_(self.v_out.view(tokens, self.kv_heads, self.dim))
+        if self.window is not None:
+            self.window.gather()
         self.writer()
         self.attention()
+        if self.window is not None:
+            self.window.commit()
         gate = torch.sigmoid(self.qgk_out[:, self.q_width:2 * self.q_width].float()).to(hidden.dtype)
         self.attended.mul_(gate)
         attn = self.attn_reduce(self.o_proj(self.attended))
@@ -153,19 +164,22 @@ class PreparedLayer:
 
 class PreparedDecoder:
     def __init__(self, weights, scratch: Scratch, metadata, pool, *, mode, session, name, workspace, layer_buffers,
-                 runtime=None, coordinator=None, vocabulary_runtime=None, buffers=None, scoring=None):
+                 runtime=None, coordinator=None, vocabulary_runtime=None, buffers=None, scoring=None, staging=None):
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         config = self.config = weights.config
         self.eps = config.rms_norm_eps
         device = scratch.activations.device
         self.cache_metadata = PagedAttentionMetadata(metadata, page_tokens=PAGE_TOKENS, buffers=buffers)
+        self.windows = WindowMetadata(metadata, pool, config, weights.shard, mode=mode, buffers=buffers,
+                                      staging=staging)
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.activations,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
         self.inverse_frequency = config.rotary_inverse(device)
         self.layers = [PreparedLayer(index, layer_weights, config, scratch.normalized, metadata, pool,
                                      shard=weights.shard, runtime=runtime, coordinator=coordinator, mode=mode,
                                      session=session, name=f"{name}.layer{index}", workspace=workspace,
-                                     buffers=layer_buffers.cursor(), cache_metadata=self.cache_metadata)
+                                     buffers=layer_buffers.cursor(), cache_metadata=self.cache_metadata,
+                                     windows=self.windows)
                        for index, layer_weights in enumerate(weights.layers)]
         self.scoring = None if scoring is None else scoring.prepare(scratch.normalized, weights.head,
             vocabulary=config.vocabulary, session=session, coordinator=coordinator, name=name + ".prompt")
@@ -187,6 +201,7 @@ class PreparedDecoder:
     def __call__(self):
         m = self.metadata
         self.cache_metadata()
+        self.windows()
         frequency = m.positions.clamp_min(0).float()[:, None] * self.inverse_frequency[None, :]
         table = torch.cat((frequency, frequency), dim=-1)
         cos, sin = table.cos().bfloat16().float(), table.sin().bfloat16().float()
