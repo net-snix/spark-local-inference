@@ -79,6 +79,9 @@ class Checkpoint:
     mapped_host_bytes: int = 0
     # The share of `device_bytes` that holds the draft model, loaded only for learned drafts.
     draft_bytes: int = 0
+    # The draft model's device bytes when --online-mxfp8 stores its BF16 projections as MXFP8,
+    # or None when plans keep `draft_bytes` either way.
+    online_mxfp8_draft_bytes: int | None = None
     # Device bytes that loading adds beyond the stored tensors, such as block scales
     # expanded from a compressed encoding.
     expansion_bytes: int = 0
@@ -288,12 +291,14 @@ class Recipe:
         return ranks[world_size] if method is None else method.ranks[world_size]
 
     def weights_bytes(self, checkpoint: Checkpoint, world_size: int, speculation: Speculation | None,
-                      expert_scale_compression: str | None = None) -> int:
+                      expert_scale_compression: str | None = None, online_mxfp8: bool = False) -> int:
         """Estimate one rank's device weights from the checkpoint's stored tensors and their expansion."""
         learned = speculation is not None
         device_bytes = (checkpoint.device_bytes if expert_scale_compression is None else
                         checkpoint.scale_compressed_device_bytes[expert_scale_compression])
         draft_bytes = checkpoint.draft_bytes
+        if online_mxfp8 and checkpoint.online_mxfp8_draft_bytes is not None:
+            draft_bytes = checkpoint.online_mxfp8_draft_bytes
         method = None if speculation is None else self.speculative_methods.get(speculation.method)
         if method is not None and method.draft_bytes is not None:
             draft_bytes = method.draft_bytes

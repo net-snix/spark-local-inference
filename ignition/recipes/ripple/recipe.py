@@ -21,6 +21,12 @@ _BF16_BYTES = 129_565_378_720
 _MXFP8_BYTES = 65_745_715_200 + 2_058_537_120
 # b12x keeps each projection's UE8M0 scales twice on the device: as loaded and in MMA layout.
 _MXFP8_SCALE_BYTES = 63_753_420_800 // 32
+# --online-mxfp8 also converts the drafter's fc, QKV, output and MLP projections (3,853,516,800 weights) to
+# one E4M3 byte plus twice one UE8M0 byte per 32, and keeps a BF16 copy of its context K/V projections.
+_DRAFT_PROJECTIONS = 3_853_516_800
+_DRAFT_CONTEXT_KV_BYTES = 5 * 2 * 1_024 * 5_120 * 2
+_ONLINE_MXFP8_DRAFT_BYTES = (_DRAFT_BYTES + _EMBEDDING_BYTES - _DRAFT_PROJECTIONS * 2
+                             + _DRAFT_PROJECTIONS * 17 // 16 + _DRAFT_CONTEXT_KV_BYTES)
 _FP8_KV_DTYPE = "float8_e4m3fn"
 
 
@@ -91,13 +97,15 @@ def usage(prepared):
 _BF16_CHECKPOINT = Checkpoint(alias="ripple-65b", repository="ricursiveAI/Ripple-65B-Preview",
     revision="240d5966cbe00f0627c699e59ef58560b60303cf", architecture="RicursiveForCausalLM",
     stored_bytes=_BF16_BYTES, device_bytes=_BF16_BYTES + 2 * _EMBEDDING_BYTES + _DRAFT_BYTES,
-    decode_weight_bytes=_BF16_BYTES, draft_bytes=_DRAFT_BYTES + _EMBEDDING_BYTES)
+    decode_weight_bytes=_BF16_BYTES, draft_bytes=_DRAFT_BYTES + _EMBEDDING_BYTES,
+    online_mxfp8_draft_bytes=_ONLINE_MXFP8_DRAFT_BYTES)
 # A GPTQ MXFP8 build of the same checkpoint that fits one 96 GB GPU; see
 # docs/model-preparation.md for how it is made and its measured KL divergence.
 _MXFP8_CHECKPOINT = Checkpoint(alias="ripple-65b-mxfp8", repository="notSnix/Ripple-65B-Preview-MXFP8-GPTQ",
     revision="bfea8efd56c3df0e8b44b028e65ea83aec05753c", architecture="RicursiveForCausalLM",
     stored_bytes=_MXFP8_BYTES, device_bytes=_MXFP8_BYTES + 2 * _EMBEDDING_BYTES + _DRAFT_BYTES,
     decode_weight_bytes=_MXFP8_BYTES, draft_bytes=_DRAFT_BYTES + _EMBEDDING_BYTES,
+    online_mxfp8_draft_bytes=_ONLINE_MXFP8_DRAFT_BYTES,
     expansion_bytes=_MXFP8_SCALE_BYTES)
 # Opt-in E4M3 KV (aliases ending in -fp8kv): values change, so BF16 KV stays the default.
 _CHECKPOINTS = (_BF16_CHECKPOINT, _MXFP8_CHECKPOINT, _fp8_kv(_BF16_CHECKPOINT), _fp8_kv(_MXFP8_CHECKPOINT))

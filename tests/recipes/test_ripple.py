@@ -490,6 +490,30 @@ def test_declared_draft_bytes_match_the_draft_tensors():
     draft = inspect_indexed_checkpoint(draft_snapshot("config.json", "model.safetensors"))
     assert {tensor.dtype for tensor in draft.tensors.values()} == {"BF16"}
     assert sum(tensor.nbytes for tensor in draft.tensors.values()) == STORED_BYTES
+    # --online-mxfp8 converts every drafter projection DraftWeights packs.
+    from ignition.recipes.ripple.recipe import _DRAFT_PROJECTIONS
+
+    packed = ("fc.weight", "_proj.weight")
+    assert sum(tensor.nbytes // 2 for name, tensor in draft.tensors.items() if name.endswith(packed)) == (
+        _DRAFT_PROJECTIONS)
+
+
+def test_online_mxfp8_plans_the_drafter_at_mxfp8_size():
+    from ignition import planning
+
+    recipe, checkpoint = MODEL.recipe, mxfp8_checkpoint()
+    saved = checkpoint.draft_bytes - checkpoint.online_mxfp8_draft_bytes
+    assert 3_300 << 20 < saved < 3_400 << 20
+    for world in (1, 2, 4):
+        assert recipe.weights_bytes(checkpoint, world, None, online_mxfp8=True) == recipe.weights_bytes(
+            checkpoint, world, None)
+        assert recipe.weights_bytes(checkpoint, world, recipe.speculation, online_mxfp8=True) == -(
+            -(checkpoint.device_bytes + checkpoint.expansion_bytes - saved) // world)
+    # One Max-Q with the baseline export's free memory: BF16 rings then plan one full-context request.
+    gpu = (planning.Gpu(0, "NVIDIA RTX PRO 6000 Blackwell Max-Q", "GPU-0", 96 << 30, 97_320 << 20, (12, 0)),)
+    plans = [planning.fit(recipe, checkpoint, gpu, concurrency=4, reserve_bytes=0, speculation=recipe.speculation,
+                          prefill_chunk=2048, online_mxfp8=online) for online in (False, True)]
+    assert plans[0].context < recipe.context == plans[1].context
 
 
 def test_eos_ids_merge_config_and_tokenizer():
