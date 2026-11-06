@@ -137,19 +137,24 @@ def _validate_trailing(Sources, Destinations, Operations, Expected, Count, Error
     tl.store(Errors + row, error)
 
 
+# A CUDA grid's second dimension holds at most 65,535 blocks; longer rows loop over their tiles.
+_ROW_BLOCK, _ROW_PROGRAMS = 4096, 32768
+
+
 @triton.jit
 def _copy_rows(Backing, Sources, Destinations, Operations, Count, Errors,
                ROW_BYTES: tl.constexpr, BLOCK: tl.constexpr, EXCLUDED: tl.constexpr):
-    row, tile = tl.program_id(0), tl.program_id(1)
+    row, first = tl.program_id(0), tl.program_id(1)
     source, destination = tl.load(Sources + row), tl.load(Destinations + row)
     copying = tl.load(Operations + row) == 0
     active = (row < tl.load(Count)) & (tl.load(Errors + row) == 0)
-    index = tile * BLOCK + tl.arange(0, BLOCK)
-    mask = active & (index < ROW_BYTES)
-    for span in tl.static_range(len(EXCLUDED)):
-        mask &= (index < EXCLUDED[span][0]) | (index >= EXCLUDED[span][1])
-    value = tl.load(Backing + source * ROW_BYTES + index, mask & copying, other=0)
-    tl.store(Backing + destination * ROW_BYTES + index, value, mask)
+    for tile in range(first, tl.cdiv(ROW_BYTES, BLOCK), tl.num_programs(1)):
+        index = tile * BLOCK + tl.arange(0, BLOCK)
+        mask = active & (index < ROW_BYTES)
+        for span in tl.static_range(len(EXCLUDED)):
+            mask &= (index < EXCLUDED[span][0]) | (index >= EXCLUDED[span][1])
+        value = tl.load(Backing + source * ROW_BYTES + index, mask & copying, other=0)
+        tl.store(Backing + destination * ROW_BYTES + index, value, mask)
 
 
 @triton.jit
@@ -245,7 +250,7 @@ class PreparedStateTransfer:
         self.validate_args = (c.source_slots, c.destination_slots, c.operation, c.expected_consumed, c.num_ops,
             c.errors, consumed, tables, c.request_slots, state_rows, requests.consumed_tokens, requests.consumed_tokens.stride(0), pool.memory_capacity, consumed.stride(0), tables.shape[1], page_tokens, self.capacity)
         self.row_args = (pool.backing, c.source_slots, c.destination_slots, c.operation, c.num_ops, c.errors,
-                         pool.layout.row_bytes, 4096,
+                         pool.layout.row_bytes, _ROW_BLOCK,
                          tuple((region.offset, region.offset + region.nbytes)
                                for name in excluded_regions for region in (pool.layout.region(name),)))
         self.page_args = [(pointer, pool.backing, tables, c.source_slots, c.destination_slots, c.operation,
@@ -266,7 +271,8 @@ class PreparedStateTransfer:
         self._validate = _compile(_validate, self.validate_args, (self.capacity, 1, 1))
         if self.trailing_validation_args is not None:
             self._trailing_validate = _compile(_validate_trailing, self.trailing_validation_args, (self.capacity, 1, 1))
-        self._copies = [_compile(_copy_rows, self.row_args, (self.capacity, triton.cdiv(self.pool.layout.row_bytes, 4096), 1))]
+        tiles = min(triton.cdiv(self.pool.layout.row_bytes, _ROW_BLOCK), _ROW_PROGRAMS)
+        self._copies = [_compile(_copy_rows, self.row_args, (self.capacity, tiles, 1))]
         for args in self.page_args:
             self._copies.append(_compile(_copy_pages, args, (self.capacity, args[0].shape[0], triton.cdiv(args[12], 1024))))
 
