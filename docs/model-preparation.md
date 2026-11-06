@@ -1097,8 +1097,22 @@ layer applies normalization before and after attention and the MLP, a sigmoid
 attention output gate, a first-layer value residual blended into later layers,
 the clamped FFN activation, and the checkpoint's embedding scale. Attention and
 MLP projections shard across ranks; the vocabulary head is sharded and the BF16
-embedding is replicated on every rank. KV pages are BF16 and reside in device
-memory.
+embedding is replicated on every rank.
+
+Full-attention layers keep paged KV for each request's whole history. Sliding-window
+layers only read the last 1,024 positions, so each request keeps their keys and
+values in a ring of 128-token pages inside its continuation row: 10 pages with
+DFlash2's 16-token rounds, 9 without, enough that a round never overwrites a page
+it reads. Prefill chunks are wider than a ring; they gather the window into scratch
+pages, attend there and commit the last ring pages back. Attention reads rings and
+history through page tables in logical page order, so the arithmetic matches paged
+history: with plain decoding or fixed-width verification (`--no-mtp-adaptive-verification`)
+served tokens and logprobs are bit-identical to the paged layout. Adaptive verification
+picks layouts from measured timings and is not run-to-run reproducible with either layout. Shared
+KV pages therefore hold only the 16 full-attention layers, 64 KiB per token in BF16
+instead of 320 KiB, while a continuation row grows to 368 MiB at TP1 (a prefix
+snapshot costs one row). KV is BF16 and resides in device memory; the `-fp8kv`
+aliases below store it as E4M3.
 
 The pinned BF16 `ricursiveAI/Ripple-65B-Preview-DFlash2` draft is fetched into the
 Hub cache with the target. It consumes residual features from target layers 1,
@@ -1120,16 +1134,17 @@ template. Prepare on the same GPU architecture as the serving devices:
 flare run PACKAGE --gpus 0,1
 ```
 
-The recipe context capacity is 262144 tokens, but BF16 weights leave room for
-roughly 150,000 KV tokens across all requests on two 96 GB GPUs. A runtime
+The recipe context capacity is 262144 tokens. Before sliding-window rings, BF16
+weights left room for roughly 150,000 KV tokens across all requests on two 96 GB
+GPUs; rings cut KV bytes per token fivefold (not yet re-measured on two GPUs). A runtime
 request is limited to the KV pages actually allocated, after the draft rings are
 reserved. The recipe is validated with tensor parallelism two on RTX PRO 6000
 Blackwell GPUs, and `ripple-65b-mxfp8` also on one. `--no-mtp` skips the draft download and omits its weights,
 rings, and speculative graphs.
 `--online-mxfp8` converts target and draft attention and MLP projections to MXFP8
 while loading. It halves decode weight traffic and, on two RTX PRO 6000 GPUs,
-raises the KV budget to about 345,000 tokens, enough for one full-context
-request. MXFP8 changes the checkpoint arithmetic, so BF16 remains the default.
+raised the KV budget to about 345,000 tokens before rings. Planning counts the
+drafter at its MXFP8 size under `--online-mxfp8`. MXFP8 changes the checkpoint arithmetic, so BF16 remains the default.
 
 `ripple-65b-mxfp8` serves [`notSnix/Ripple-65B-Preview-MXFP8-GPTQ`](https://huggingface.co/notSnix/Ripple-65B-Preview-MXFP8-GPTQ), a ModelOpt
 `MIXED_PRECISION` checkpoint that stores all 640 decoder projections as MXFP8
@@ -1154,7 +1169,16 @@ of scratch, more than one 96 GB GPU has left after the weights.
 flare run PACKAGE --gpus 0
 ```
 
-On one RTX PRO 6000 that leaves 68,608 KV tokens (49,792 per request).
+On one RTX PRO 6000 Max-Q that leaves 320,512 KV tokens, and one request can use
+the full 262,144-token context (68,608 and 49,792 per request with paged sliding
+history).
+`ripple-65b-mxfp8-fp8kv` (and `ripple-65b-fp8kv` for the BF16 checkpoint) stores KV pages and
+rings as unscaled E4M3, which raises that to 667,648 KV tokens. Measured keys stay within
+|22| and values within |115|, inside E4M3's range, so per-tensor scales would not reduce the
+rounding error. It changes attention arithmetic: on the gate's 120 test sequences the KL
+against the BF16 reference rises from 0.00217 to 0.00466 (worse on 119), and 32k-token prompt
+logprobs move by 0.02 to 0.07 nats on average without growing with position. Passkeys at
+32k and 261k tokens are still retrieved. BF16 KV remains the default.
 Weight-only GEMMs keep decode near the two-GPU BF16 package (76 tokens per second
 mean single stream with DFlash2), but prefill runs at about 1,050 tokens per second. Prefill stays weight-only on purpose: quantizing
 the prompt positions' activations to MXFP8 as well raised the KL of the 1,024
