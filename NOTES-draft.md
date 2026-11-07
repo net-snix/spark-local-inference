@@ -106,5 +106,5 @@ Serve it through the lane as usual (no extra args). Measure: tools/arm.sh <outdi
 with tools/draftsum.py DIR... --arms base full. Kernel tests: FLARE_RUN_CUDA_TESTS=1 pytest
 tests/components/test_dflash2_full_attention.py (CUDA_VISIBLE_DEVICES = the Max-Q only).
 
-Next: lossless check, more full/base reps (job4 holds 2-4: rerun tools/job4.sh; it skips nothing done), greedy check on full, block 16 vs 8-12 not
+Next: lossless check, more full/base reps (tools/job4.sh holds 2-4; delete its hold 1 line first, or it rewrites ab4/1-3), greedy check on full, block 16 vs 8-12 not
 tried, BF16 rings branch (draft2) unmeasured.
