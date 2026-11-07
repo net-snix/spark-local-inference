@@ -148,7 +148,7 @@ def _copy_rows(Backing, Sources, Destinations, Operations, Count, Errors,
     source, destination = tl.load(Sources + row), tl.load(Destinations + row)
     copying = tl.load(Operations + row) == 0
     active = (row < tl.load(Count)) & (tl.load(Errors + row) == 0)
-    for tile in range(first, tl.cdiv(ROW_BYTES, BLOCK), tl.num_programs(1)):
+    for tile in range(first, (ROW_BYTES + BLOCK - 1) // BLOCK, tl.num_programs(1)):
         index = tile * BLOCK + tl.arange(0, BLOCK)
         mask = active & (index < ROW_BYTES)
         for span in tl.static_range(len(EXCLUDED)):
