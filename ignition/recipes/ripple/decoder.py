@@ -25,7 +25,6 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
 from .config import PAGE_TOKENS
-from .residual_norm import MAX_ROWS, residual_norm as fused_residual_norm
 from .window import WindowMetadata
 
 
@@ -50,9 +49,10 @@ def staged_residual_norm(delta, hidden, post_weight, weight, eps, *, start=None,
 
 
 def residual_norm(delta, hidden, post_weight, weight, eps, *, start=None, blend=None):
-    # Decode-sized rows run one fused, bit-identical kernel; prefill keeps the staged Inductor chain.
-    norm = fused_residual_norm if hidden.is_cuda and hidden.shape[0] <= MAX_ROWS else staged_residual_norm
-    return norm(delta, hidden, post_weight, weight, eps, start=start, blend=blend)
+    # Every row count runs the staged Inductor chain. The fused decode kernel in residual_norm.py matches it
+    # bit for bit in isolation, but served decode with it diverged from the baseline (rarely, from one verify
+    # round on), so it stays unwired until that is explained (NOTES.md, 2026-11-07).
+    return staged_residual_norm(delta, hidden, post_weight, weight, eps, start=start, blend=blend)
 
 
 def _reduced(reduction: PreparedAllReduce, partial: torch.Tensor) -> torch.Tensor:
