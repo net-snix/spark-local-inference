@@ -200,7 +200,9 @@ def test_pages_and_state_rows_match_declared_costs(drafted, world, drafting):
     layout = continuation_layout(drafted, shard, draft=drafting)
     assert layout.row_bytes == costs.state_row_bytes
     paged = 17 if drafting else 16
-    assert page_bytes(drafted, shard, draft=drafting) == costs.page_bytes == paged * 2 * 128 * (8 // world) * 128 * 2
+    # The drafter's paged layer keeps FP8 E4M3 fields: one BF16 record for its key and value together.
+    records = 33 if drafting else 32
+    assert page_bytes(drafted, shard, draft=drafting) == costs.page_bytes == records * 128 * (8 // world) * 128 * 2
     pool = ContinuationPool.for_model(drafted, 3, 2, "meta", shard=shard, draft=drafting)
     assert pool.layout.row_bytes == costs.state_row_bytes
     assert len(pool.pages) == 2 * paged and sum(page[0].nbytes for page in pool.pages.values()) == costs.page_bytes
@@ -225,12 +227,12 @@ def test_draft_costs_add_rings_a_ring_page_and_the_paged_full_layer():
     for world in (1, 2, 4):
         plain, drafting = recipe.costs(world, None), recipe.costs(world, recipe.speculation)
         record = 128 * (8 // world) * 128 * 2
-        # The drafter's full-attention layer keeps its context keys and values in every page record.
-        assert drafting.page_bytes == plain.page_bytes + 2 * record and drafting.graph_bytes == plain.graph_bytes
+        # The drafter's full-attention layer keeps its FP8 context keys and values in every page record.
+        assert drafting.page_bytes == plain.page_bytes + record and drafting.graph_bytes == plain.graph_bytes
         # Sixteen-token rounds keep one more ring page per sliding layer than single tokens; the four
         # sliding draft layers keep FP8 rings, the full one a partial page.
         assert drafting.state_row_bytes - plain.state_row_bytes == (
-            4 * 2 * 4096 * (8 // world) * 128 + 128 * record + 2 * record)
+            4 * 2 * 4096 * (8 // world) * 128 + 128 * record + record)
 
 
 def test_ripple_pool_pages_the_full_attention_draft_layer(drafted):
@@ -242,7 +244,7 @@ def test_ripple_pool_pages_the_full_attention_draft_layer(drafted):
     assert pool.draft_full_context
     assert drafted.draft.full_attention_layers == (4,)
     keys, values = pool.draft_pages(4)
-    assert keys.shape == values.shape == (2, 128, 8, 128) and keys.dtype == torch.bfloat16
+    assert keys.shape == values.shape == (2, 128, 8, 128) and keys.dtype == torch.float8_e4m3fn
     assert all(pool.draft_pages(layer) is None for layer in range(4))
     names = {region.name for region in continuation_layout(drafted, shard, draft=True).regions}
     # Sliding draft layers keep rings; the full layer's partial page travels with the row instead.

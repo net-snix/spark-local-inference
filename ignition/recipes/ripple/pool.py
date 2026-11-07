@@ -113,7 +113,7 @@ class ContinuationPool(PagedStateStorage):
         ring = self._ring(next(int(r.name[5:].split(".")[0]) for r in self.layout.regions
                                if r.name.startswith("layer") and r.dtype != torch.uint8))
         heads, dim = ring.shape[1:]
-        return tuple(self.pages[f"draft{layer}.{field}"].view(self.kv_dtype).view(-1, PAGE_TOKENS, heads, dim)
+        return tuple(self.pages[f"draft{layer}.{field}"].view(torch.float8_e4m3fn).view(-1, PAGE_TOKENS, heads, dim)
                      for field in ("key", "value"))
 
     def _ring(self, layer):

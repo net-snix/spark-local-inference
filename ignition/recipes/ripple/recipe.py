@@ -40,9 +40,11 @@ def _costs(world: int, *, draft: bool, kv_bytes: int = 2) -> RankCosts:
     record = 128 * (8 // world) * 128 * kv_bytes
     rings = 64 * 2 * (10 if draft else 9) * record
     draft_rings = 4 * 2 * 4096 * (8 // world) * 128 if draft else 0
-    paged = 16 + (1 if draft else 0)
-    row = rings + paged * 2 * record + draft_rings + 10_496
-    return RankCosts(-(-row // record) * record, paged * 2 * record, _GRAPH_BYTES)
+    # The drafter's paged full-attention layer keeps FP8 E4M3 keys and values.
+    draft_pages = 2 * 128 * (8 // world) * 128 if draft else 0
+    page = 16 * 2 * record + draft_pages
+    row = rings + page + draft_rings + 10_496
+    return RankCosts(-(-row // record) * record, page, _GRAPH_BYTES)
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,

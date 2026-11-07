@@ -142,11 +142,15 @@ def draft_context_specs(config, shard, *, paged=()):
             yield f"draft{layer}.{name}", (geometry.window, heads, width), torch.float8_e4m3fn
 
 
-def draft_page_specs(config, shard, page_tokens, kv_dtype):
+def draft_page_specs(config, shard, page_tokens, kv_dtype=None):
     """Page-record fields holding the full-attention draft layers' context keys and values.
 
     They share the target's page tables, so these layers read every accepted context position.
+    The fields are FP8 E4M3 like the sliding layers' rings, whatever the target's KV dtype.
     """
+    import torch
+
+    kv_dtype = torch.float8_e4m3fn
     geometry = config.attention
     _, heads = geometry.local(shard)
     for layer in config.full_attention_layers:
