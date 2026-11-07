@@ -219,7 +219,8 @@ class PreparedDecoder:
         draft = config.draft if weights.draft is not None else None
         self.taps = () if draft is None else draft.target_layers
         self.context_capture = None if draft is None else PreparedContextCapture(metadata,
-            config.hidden * len(self.taps), draft.attention.window, compact_prefill=mode == "prefill",
+            config.hidden * len(self.taps), draft.attention.window,
+            compact_prefill=mode == "prefill" and not getattr(pool, "draft_full_context", False),
             buffers=buffers)
         self.auxiliary = None if self.context_capture is None else self.context_capture.output
 

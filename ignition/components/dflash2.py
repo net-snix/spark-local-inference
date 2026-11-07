@@ -10,6 +10,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, rotate_half
 
 from ignition.components.candidate_selector import PreparedCandidateSelector
 from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllGather
+from ignition.components.dflash2_full_attention import SPLITS, PreparedDraftFullAttention
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.grouped_convolution import PreparedGroupedConvolution
 from ignition.components.linear import prepare_projection
@@ -83,7 +84,9 @@ class PreparedContext:
     The supplied cursor is dedicated to context scratch. Each graph variant forks
     its starting position; target auxiliary features must occupy disjoint storage.
     Compact prefill consumes a suffix captured from all live input rows; counts
-    must equal the metadata lengths used by PreparedContextCapture.
+    must equal the metadata lengths used by PreparedContextCapture. Layers whose
+    context the pool keeps in page records (`pool.draft_pages`) receive every
+    accepted row at its page slot, so they require uncompacted capture.
     """
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace,
@@ -106,6 +109,7 @@ class PreparedContext:
         self.key = scratch.zeros((tokens, kv_heads, a.key_dim), torch.bfloat16)
         self.value = scratch.zeros((tokens, kv_heads, a.value_dim), torch.bfloat16)
         self.slots = scratch.full((tokens,), -1, torch.int64)
+        self.page_slots = scratch.full((tokens,), -1, torch.int64)
         self.inverse = _inverse(a, auxiliary.device)
         self.rotary_layers = c.rotary_layers
         self.project = prepare_projection(auxiliary, weights.draft.projection, self.local,
@@ -115,12 +119,21 @@ class PreparedContext:
         self.norm = _norm(weights.draft.hidden_norm, c.text["rms_norm_eps"])
         self.project_kv = prepare_projection(self.projected, weights.draft.context_kv, self.kv,
             session=session, name=name + ".kv", workspace=workspace)
-        self.layers = []
+        self.layers, self.paged = [], False
+        pages_of = getattr(pool, "draft_pages", lambda layer: None)
         for index, layer in enumerate(weights.draft.layers):
             norm = _norm(layer.key_norm, c.text["rms_norm_eps"])
-            writer = PreparedPagedKVWriter(self.key, self.value,
-                pool.reserved_region(f"draft{index}.key"), pool.reserved_region(f"draft{index}.value"),
-                self.slots, session=session, name=f"{name}.{index}.write")
+            pages = pages_of(index)
+            if pages is None:
+                writer = PreparedPagedKVWriter(self.key, self.value,
+                    pool.reserved_region(f"draft{index}.key"), pool.reserved_region(f"draft{index}.value"),
+                    self.slots, session=session, name=f"{name}.{index}.write")
+            else:
+                if self.compact_positions is not None:
+                    raise ValueError("paged DFlash2 context requires uncompacted prefill capture")
+                writer = PreparedPagedKVWriter(self.key, self.value, *pages, self.page_slots,
+                    session=session, name=f"{name}.{index}.write")
+                self.paged = True
             self.layers.append((norm, writer))
 
     def __call__(self, auxiliary, counts):
@@ -130,6 +143,11 @@ class PreparedContext:
             offset = positions - m.starts[m.requests]
             count = counts[m.requests]
             valid = (positions >= 0) & (offset >= 0) & (offset < count)
+            if self.paged:
+                columns = (positions.clamp_min(0) // PAGE_TOKENS).clamp(max=m.token_page_table.shape[1] - 1)
+                pages = m.token_page_table[torch.arange(positions.numel(), device=positions.device), columns]
+                self.page_slots.copy_(torch.where(valid & (pages >= 0),
+                    pages.long() * PAGE_TOKENS + positions.remainder(PAGE_TOKENS), -1))
             valid &= offset >= (count - self.window).clamp_min(0)
             states = m.state_rows[m.requests]
         else:
@@ -156,7 +174,7 @@ class PreparedContext:
             writer()
 
     def scratch_tensors(self):
-        tensors = self.local, self.projected, self.kv, self.key, self.value, self.slots
+        tensors = self.local, self.projected, self.kv, self.key, self.value, self.slots, self.page_slots
         return tensors if self.compact_positions is None else (*tensors, self.compact_positions)
 
 
@@ -180,12 +198,15 @@ class DraftScratch:
     gathered_logits: torch.Tensor
     logits: torch.Tensor
     convolution: dict
+    # Split partials of full-context draft attention; empty when every layer reads a ring.
+    full_accumulators: torch.Tensor
+    full_lse: torch.Tensor
     retained: list = field(default_factory=list)
     selectors: dict = field(default_factory=dict)
     block_size: int = 8
 
     @classmethod
-    def allocate(cls, config, shard, tokens, device, *, buffers, block_size=None):
+    def allocate(cls, config, shard, tokens, device, *, buffers, block_size=None, full_context=False):
         block_size = config.block_size if block_size is None else block_size
         if tokens <= 0 or tokens % block_size:
             raise ValueError("DFlash2 scratch requires complete proposal blocks")
@@ -201,6 +222,9 @@ class DraftScratch:
         taps, group = config.convolution
         convolution = dict(coefficients=zeros(tokens, 2 * taps * hidden // group),
                            before=zeros(tokens, hidden), after=zeros(tokens, hidden))
+        parts = SPLITS + 1 if full_context else 0
+        full = (zeros(parts, tokens, heads, a.value_dim, dtype=torch.float32),
+                zeros(parts, tokens, heads, dtype=torch.float32))
         return cls(zeros(tokens, hidden // shard.world_size), zeros(tokens, hidden), zeros(tokens, hidden),
             zeros(tokens, heads * a.key_dim + kv_heads * (a.key_dim + a.value_dim)),
             zeros(tokens, heads, a.key_dim), zeros(tokens, kv_heads, a.key_dim),
@@ -210,14 +234,15 @@ class DraftScratch:
             zeros(pages, PAGE_TOKENS, kv_heads, a.value_dim, dtype=torch.float8_e4m3fn),
             MLPScratch.allocate(tokens, hidden, c["intermediate_size"] // shard.world_size, device, buffers=s),
             zeros(tokens, hidden), zeros(tokens, vocab_width), zeros(tokens, vocab_width * shard.world_size),
-            zeros(tokens, c["vocab_size"], dtype=torch.float32), convolution, block_size=block_size)
+            zeros(tokens, c["vocab_size"], dtype=torch.float32), convolution, *full, block_size=block_size)
 
     def rows(self, tokens, samples):
         if (not 0 < tokens <= self.embedding.shape[0] or samples != tokens
                 or tokens % self.block_size):
             raise ValueError("DFlash2 scratch requires complete proposal blocks")
         return type(self)(*(getattr(self, name) if name in
-            ("window_key", "window_value", "convolution", "retained", "selectors", "block_size") else self.mlp.rows(tokens) if name == "mlp"
+            ("window_key", "window_value", "convolution", "full_accumulators", "full_lse", "retained",
+             "selectors", "block_size") else self.mlp.rows(tokens) if name == "mlp"
             else getattr(self, name)[:tokens] for name in self.__dataclass_fields__))
 
     def scratch_tensors(self):
@@ -225,7 +250,11 @@ class DraftScratch:
 
 
 class DraftAttention:
-    """Noncausal GQA over accepted context followed by a private eight-token block."""
+    """Noncausal GQA over accepted context followed by the private proposal block.
+
+    A layer whose context the pool keeps in page records reads the request's whole history
+    (`dflash2_full_attention`); the others read their ring through staged FP8 pages.
+    """
 
     def __init__(self, index, weights, source, config, shard, scratch, metadata, pool, *,
                  runtime, coordinator, session, name, workspace, buffers):
@@ -236,6 +265,16 @@ class DraftAttention:
         self.k_norm = _norm(weights.key_norm, config.text["rms_norm_eps"])
         self.inverse = _inverse(a, source.device)
         self.rotary = config.rotary_layers[index]
+        self.output = prepare_projection(scratch.attended.flatten(1), weights.output, scratch.partial,
+            session=session, name=name + ".output", workspace=workspace)
+        self.reduce = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime, coordinator=coordinator,
+            session=session, name=name + ".reduce")
+        pages = getattr(pool, "draft_pages", lambda layer: None)(index)
+        self.full = None if pages is None else PreparedDraftFullAttention(scratch.query, *pages, metadata,
+            scratch.key, scratch.value, scratch.attended, rows=scratch.block_size,
+            accumulators=scratch.full_accumulators, lse=scratch.full_lse)
+        if self.full is not None:
+            return
         self.history_key, self.history_value = (pool.reserved_region(f"draft{index}.{kind}")
                                                for kind in ("key", "value"))
         rows = metadata.lengths.numel()
@@ -250,10 +289,6 @@ class DraftAttention:
             self.pages, self.lengths, metadata.query_start_loc, scratch.attended,
             mode="verify", width=scratch.block_size, window=a.window - 1, causal=False,
             session=session, workspace=workspace, name=name + ".attention")
-        self.output = prepare_projection(scratch.attended.flatten(1), weights.output, scratch.partial,
-            session=session, name=name + ".output", workspace=workspace)
-        self.reduce = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime, coordinator=coordinator,
-            session=session, name=name + ".reduce")
 
     def __call__(self, source):
         s, m = self.scratch, self.metadata
@@ -264,6 +299,9 @@ class DraftAttention:
         s.query.copy_(query)
         s.key.copy_(key)
         s.value.copy_(v.view_as(s.value))
+        if self.full is not None:
+            self.full()
+            return self.reduce(self.output(s.attended.flatten(1)))
         self.staging()
         self.lengths.copy_(torch.where(m.lengths > 0, m.starts.clamp(max=self.window) + m.lengths, 0).int())
         self.attention()

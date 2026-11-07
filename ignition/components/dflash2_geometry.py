@@ -93,10 +93,10 @@ class DFlash2Config:
     def full_attention_layers(self):
         """Draft layers declared as full attention.
 
-        Every layer reads the same accepted-context ring of `sliding_window`
-        tokens, so a full-attention layer sees exact context up to that length
-        and the most recent window beyond it. This bounds proposal quality on
-        long contexts, never target correctness.
+        A recipe that keeps these layers' context in page records (`draft_page_specs`) lets them
+        attend to the whole request. Otherwise every layer reads the same accepted-context ring of
+        `sliding_window` tokens, so a full-attention layer sees exact context up to that length and
+        only the most recent window beyond it. Either bounds proposal quality, never target correctness.
         """
         return tuple(index for index, kind in enumerate(self.text["layer_types"]) if kind == "full_attention")
 
@@ -129,12 +129,26 @@ class DFlash2Config:
         shard.partition(self.text["intermediate_size"], alignment=128)
 
 
-def draft_context_specs(config, shard):
-    """Continuation storage for the drafter's accepted target KV rings."""
+def draft_context_specs(config, shard, *, paged=()):
+    """Continuation storage for the drafter's accepted target KV rings, except `paged` layers."""
     import torch
 
     geometry = config.attention
     _, heads = geometry.local(shard)
     for layer in range(config.layers):
+        if layer in paged:
+            continue
         for name, width in (("key", geometry.key_dim), ("value", geometry.value_dim)):
             yield f"draft{layer}.{name}", (geometry.window, heads, width), torch.float8_e4m3fn
+
+
+def draft_page_specs(config, shard, page_tokens, kv_dtype):
+    """Page-record fields holding the full-attention draft layers' context keys and values.
+
+    They share the target's page tables, so these layers read every accepted context position.
+    """
+    geometry = config.attention
+    _, heads = geometry.local(shard)
+    for layer in config.full_attention_layers:
+        for name, width in (("key", geometry.key_dim), ("value", geometry.value_dim)):
+            yield f"draft{layer}.{name}", (page_tokens * heads * width * kv_dtype.itemsize,)

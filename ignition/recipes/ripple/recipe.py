@@ -31,16 +31,18 @@ _FP8_KV_DTYPE = "float8_e4m3fn"
 
 
 def _costs(world: int, *, draft: bool, kv_bytes: int = 2) -> RankCosts:
-    # Paged KV for the 16 full-attention layers: 2 x 128 tokens x (8 / world) heads x 128 x kv_bytes each.
-    # A state row holds the 64 sliding layers' key/value rings (pool.window_pages: 10 pages of 128 tokens
-    # with 16-token DFlash2 rounds, 9 with one token), one partial page per full layer, the last hidden
-    # state and the consumed-token cursor, with DFlash2 the drafter's five FP8 key/value rings of 4,096
-    # tokens, all rounded up to whole page records.
+    # Paged KV for the 16 full-attention layers, and with DFlash2 the drafter's full-attention layer:
+    # 2 x 128 tokens x (8 / world) heads x 128 x kv_bytes each. A state row holds the 64 sliding layers'
+    # key/value rings (pool.window_pages: 10 pages of 128 tokens with 16-token DFlash2 rounds, 9 with one
+    # token), one partial page per paged layer, the last hidden state and the consumed-token cursor, with
+    # DFlash2 the drafter's four sliding layers' FP8 key/value rings of 4,096 tokens, all rounded up to
+    # whole page records.
     record = 128 * (8 // world) * 128 * kv_bytes
     rings = 64 * 2 * (10 if draft else 9) * record
-    draft_rings = 5 * 2 * 4096 * (8 // world) * 128 if draft else 0
-    row = rings + 16 * 2 * record + draft_rings + 10_496
-    return RankCosts(-(-row // record) * record, 16 * 2 * record, _GRAPH_BYTES)
+    draft_rings = 4 * 2 * 4096 * (8 // world) * 128 if draft else 0
+    paged = 16 + (1 if draft else 0)
+    row = rings + paged * 2 * record + draft_rings + 10_496
+    return RankCosts(-(-row // record) * record, paged * 2 * record, _GRAPH_BYTES)
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
