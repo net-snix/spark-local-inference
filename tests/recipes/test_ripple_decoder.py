@@ -60,6 +60,8 @@ def _layer(generator, clamp):
     layer.gate_up = _Linear(layer.matrices["gate_up"], layer.gate_up_out)
     layer.down = _Linear(layer.matrices["down"], layer.mlp_partial)
     layer.writer = lambda: None
+    # A sliding layer stages its KV ring around attention (window.py); staging moves pages, no arithmetic.
+    layer.window = SimpleNamespace(gather=lambda: None, commit=lambda: None)
     # Stand-in attention: every query head attends to itself.
     layer.attention = lambda: layer.attended.view(TOKENS, HEADS, DIM).copy_(layer.q)
     # A single rank's reduction is never called: it would fail here.
