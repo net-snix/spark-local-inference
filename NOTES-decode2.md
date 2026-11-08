@@ -42,6 +42,31 @@ Findings:
   `mul.bf16x2` (`_lib/intrinsics/packed.py::mxfp8_pair_to_bf16x2_sm120`). The fused Triton kernel (gate_up,
   down: 62-67% of the round) used FP32: e4m3x2->f16x2, 2x f16->f32, ex2.approx scale, f32 mul, f32->bf16x2.
 
+## Profile of e1 on the WS (2026-11-08, tune GPU moved to the WS: 2750 MHz lock, 450 W)
+
+`results-ws/decode2/prof/e1ws-c{1,4}-node.cats.txt`, `.seq.txt` (default flags: C1 ran bucket p6, C4 p13).
+
+| category | C1 us | C4 us |
+|---|---:|---:|
+| fused a16 GEMM (gate_up, down) | 27113 | 29808 |
+| packed a16 GEMM (qgk, v, o) | 7718 | 5349 |
+| draft, sampling, bookkeeping | 4038 | 4356 |
+| a16 split-K reduce (PDL, overlaps the GEMM) | 2332 | 344 |
+| ATen mean (`reduce_kernel`) | 1083 | 1599 |
+| Inductor Triton | 904 | 979 |
+| attention + KV write | 694 | 889 |
+| lm_head | 534 | 557 |
+| gaps (all) | 2116 | 2065 |
+| span | 44319 | 45980 |
+
+One C1 layer: gate_up 226 us, down 113, qgk 62 + v 4.7, o_proj 30, attention 7.7, and 25 small kernels
+(~33 us with their 0.5 us gaps, 4 of them ATen means at 2.7 us). The WS is not power bound (406-430 W).
+Isolated DRAM-streaming bench at 16 rows on the WS (`results-ws/decode2/bench/a16-r16.log`): served
+gate_up 225.6 us vs 207.2 us read floor, down 117.7 vs 104.3, qgk 62.6 vs 55.4, o 30.6 vs 27.0. The served
+tiles are already the fastest class-A choice at 16 rows (every other tile/warp/persistent variant with the same
+split-K is equal or slower), so a pin retune buys nothing at C1. At 64 rows (Max-Q, `bench/a16-r64.log`)
+gate_up m64n128k64w4 is 13% faster than the served tile with the same bits, which is what the sweep is for.
+
 ## Kernel 1: fused MXFP8 A16 decode on F2FP + BF16 multiply (class A)
 
 `_decode_tile` builds the UE8M0 scale as a BF16 bit pattern (`e << 7`) and decodes four codes per inline-asm
@@ -97,6 +122,20 @@ smaller footprint, which buys 1,024 KV tokens.
 Not measured: the interleaved A/B (`tools/job3.sh`) never got the lock before the tonight-chain. Expected from
 the isolated bench: about -1.3 ms per round at C1 (2.4%), a little more at C4 (more fused rows of work).
 
+2026-11-08 (WS): the A/B is still not measured. The BF16 eval block (`runner/bf16_block.sh`, both cards, both
+locks) has held the GPUs since 14:09 Bergen (gsm8k, ifbench done at 15:58; mmlupro, gpqa, aime2025/2026 left).
+`tools/job-g.sh` is queued in tmux `d2-jobG` (log `results-ws/decode2/job-g.log`) and runs, each step under its
+own short lock hold: (1) `gate/ab.sh base=071333 e1=e1 4` with `AB_LOCK_PER=2` ->
+`results-ws/gate/ab/d2-e1-vs-1333/`; (2) the CUDA tests including the new tile-invariance test plus the ATen
+alignment probe (`tests-cuda2.log`, `bench/aten-align.log`); (3) a 071333 WS profile (`prof/base1333ws-*`);
+(4) the tile sweep (`bench/sweep.jsonl`, served buckets first); (5) `make_pins2.py` -> `pins-e2.json` and,
+if any pin changes, the e2 export (`e2.path`, `logs/e2.races.txt`). e2 still needs `gate/classa.sh` and its
+own A/B. Stop it with `tmux kill-session -t d2-jobG` (it holds no lock while waiting).
+
+Expected value of e2: small at the served buckets. The WS profile ran C1 at p6 and C4 at p13 for ~95% of
+rounds, and at 16 rows the served tiles are already the fastest class-A choice (bench above). The 13% gate_up
+gain is at p64, which adaptive verification picks only on high-acceptance rounds.
+
 ## Recipe
 
 ```
@@ -109,6 +148,15 @@ python3 results-maxq/decode2/tools/races_since.py "<export start, UTC>" results-
 bash gate/classa.sh <pkg> d2-e1-noad --no-mtp-adaptive-verification
 AB_LOCK_PER=2 AB_TAG=d2-e1-vs-1333 bash gate/ab.sh "base=<071333>" "e1=<pkg>" 4
 ```
+
+## Tile invariance (why a pin retune stays class A)
+
+`tests/components/test_b12x_mxfp8_fused_tiles_cuda.py`: the fused kernel's outputs are bitwise equal across
+tile_m/tile_n/tile_k, warps and stages for six Ripple shapes (16-64 rows, split-K 1/4/8), and differ when only
+split-K changes (negative control). The bench sweep checks the same thing per candidate on the real shapes
+(`bitwise True` column). The CUDA run is queued in job G (step 2); not yet run on a GPU.
+`tools/make_pins2.py` only switches a pin to a candidate that was bitwise equal, has the same split-K and
+backend, a b12x-legal tile_k (64/128) and is faster by >1.5% with non-overlapping reps.
 
 ## Not done / next
 
@@ -125,3 +173,10 @@ AB_LOCK_PER=2 AB_TAG=d2-e1-vs-1333 bash gate/ab.sh "base=<071333>" "e1=<pkg>" 4
 - dec's fused norm: the kernel takes ATen's block width from the traced row count. If the staged
   `flare::mean` sees a different runtime row count (live rows) or a non-16-byte-aligned view, ATen picks
   another order. Check those two first.
+- Small-op chain on the WS: ~25 kernels per layer outside the GEMMs and attention, ~33 us with launch gaps
+  (~2.6 ms per C1 round, 6%). Every chain contains an ATen mean (`flare::mean`, kept for its rounding) or the
+  ATen sigmoid (`flare::sigmoid`), so a fused kernel is class A only if it reproduces ATen's order in-graph,
+  which is the open question from dec. `tools/aten_mean_align.py` (queued) tests one candidate cause: ATen's
+  `input_vectorized_thread_reduce_impl` handles a row head that is not 16-byte aligned separately, so a
+  misaligned square buffer would take another order. If alignment does not change the result, the next step
+  stays dec's in-graph check variant (compute both, record the first mismatching layer/row).
