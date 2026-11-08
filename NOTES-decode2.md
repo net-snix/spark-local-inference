@@ -82,11 +82,17 @@ The working check is non-strict export plus `tools/races_since.py` showing zero 
 Any b12x source change alters `candidate_program_identity`, so the next export re-races every query and timing
 noise picks other split-K/tiles (60 of 172 blockscaled choices differed between two exports of the same
 source), which changes rounding. `B12X_SELECTION_PINS=<json>` replays recorded winners as plan overrides;
-`B12X_SELECTION_PINS_STRICT=1` raises on an unpinned query. Pins for 071333: `pins-071333.json` (172 pins from
+`B12X_SELECTION_PINS_STRICT=1` raises on an unpinned query, which also hits queries that never race, so
+it is a diagnostic only and not part of the recipe. Pins for 071333: `pins-071333.json` (172 pins from
 ledger session f32b167fcd2f, round-trip checked by `tools/pins_check.py`). Only the blockscaled component imports
 `_pins`, so other components keep their identity and cached selections.
 
 ## Results vs 071333
+
+Class A (2026-11-07 23:50 Bergen, on the WS, `results-ws/decode2/`): e1 (`gb202-tp1-202611072020`) vs 071333,
+both `--no-mtp-adaptive-verification`, 6 seeds, reference collected before and after: BIT-IDENTICAL (tokens,
+chosen logprobs, top-20). Loaded 72.77 vs 72.80 GiB, KV 325,632 vs 324,608: the 32 MiB is the e1 build's
+smaller footprint, which buys 1,024 KV tokens.
 
 Not measured: the interleaved A/B (`tools/job3.sh`) never got the lock before the tonight-chain. Expected from
 the isolated bench: about -1.3 ms per round at C1 (2.4%), a little more at C4 (more fused rows of work).
@@ -94,10 +100,12 @@ the isolated bench: about -1.3 ms per round at C1 (2.4%), a little more at C4 (m
 ## Recipe
 
 ```
-# export (holds maxq.lock; tools/export.sh)
-env B12X_SELECTION_PINS=/work/results-maxq/decode2/pins-071333.json B12X_SELECTION_PINS_STRICT=1 \
+# export (holds maxq.lock; tools/export.sh). Non-strict pins: strict mode raises on queries that never race.
+env B12X_SELECTION_PINS=/work/results-maxq/decode2/pins-071333.json \
   .venv/bin/ignition export ripple-65b-mxfp8 --gpus 0 --online-mxfp8 --prefill-chunk-size 2048 --compile-workers 6
 # with FLARE_SRC=~/Code/oss/flare-ripple-decode2 B12X_SRC=~/Code/oss/b12x-ripple-decode2 (prep-run.sh overlay)
+# check the replay: zero blockscaled races since the export started, champions equal to the pins
+python3 results-maxq/decode2/tools/races_since.py "<export start, UTC>" results-maxq/decode2/pins-071333.json
 bash gate/classa.sh <pkg> d2-e1-noad --no-mtp-adaptive-verification
 AB_LOCK_PER=2 AB_TAG=d2-e1-vs-1333 bash gate/ab.sh "base=<071333>" "e1=<pkg>" 4
 ```
