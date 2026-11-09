@@ -24,6 +24,7 @@ from ignition.components.paged_attention import (
 from ignition.components.parallel import TensorParallelShard
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
+from . import glue
 from .config import PAGE_TOKENS
 from .window import WindowMetadata
 
@@ -49,10 +50,10 @@ def staged_residual_norm(delta, hidden, post_weight, weight, eps, *, start=None,
 
 
 def residual_norm(delta, hidden, post_weight, weight, eps, *, start=None, blend=None):
-    # Every row count runs the staged Inductor chain. The fused decode kernel in residual_norm.py matches it
-    # bit for bit in isolation, but served decode with it diverged from the baseline (rarely, from one verify
-    # round on), so it stays unwired until that is explained (NOTES.md, 2026-11-07).
-    return staged_residual_norm(delta, hidden, post_weight, weight, eps, start=start, blend=blend)
+    # CUDA rows (every row count) run glue.py's row-count-invariant kernel (numerics class B against the
+    # staged ATen-mean chain, 2026-11-09); CPU keeps the staged chain.
+    norm = glue.residual_norm if hidden.is_cuda else staged_residual_norm
+    return norm(delta, hidden, post_weight, weight, eps, start=start, blend=blend)
 
 
 def _reduced(reduction: PreparedAllReduce, partial: torch.Tensor) -> torch.Tensor:
@@ -161,21 +162,29 @@ class PreparedLayer:
         w, eps, tokens = self.weights, self.eps, hidden.shape[0]
         self.qgk(normed)
         self.v_proj(value_input)
-        q = rms_norm(self.qgk_out[:, :self.q_width].view(tokens, self.heads, self.dim), w["q_norm"], eps)
-        k = rms_norm(self.qgk_out[:, 2 * self.q_width:].view(tokens, self.kv_heads, self.dim), w["k_norm"], eps)
-        if self.is_sliding:
-            q, k = rotate(q, cos, sin), rotate(k, cos, sin)
-        self.q.copy_(q)
-        self.key.copy_(k)
-        self.value.copy_(self.v_out.view(tokens, self.kv_heads, self.dim))
+        if hidden.is_cuda:
+            glue.qk_rope(self.qgk_out, self.v_out, w["q_norm"], w["k_norm"], cos, sin, self.q, self.key,
+                         self.value, eps, rope=self.is_sliding)
+        else:
+            q = rms_norm(self.qgk_out[:, :self.q_width].view(tokens, self.heads, self.dim), w["q_norm"], eps)
+            k = rms_norm(self.qgk_out[:, 2 * self.q_width:].view(tokens, self.kv_heads, self.dim), w["k_norm"], eps)
+            if self.is_sliding:
+                q, k = rotate(q, cos, sin), rotate(k, cos, sin)
+            self.q.copy_(q)
+            self.key.copy_(k)
+            self.value.copy_(self.v_out.view(tokens, self.kv_heads, self.dim))
         if self.window is not None:
             self.window.gather()
         self.writer()
         self.attention()
         if self.window is not None:
             self.window.commit()
-        gate = torch.sigmoid(self.qgk_out[:, self.q_width:2 * self.q_width].float()).to(hidden.dtype)
-        attn = _reduced(self.attn_reduce, self.o_proj(self.attended * gate))
+        if hidden.is_cuda:
+            gated = glue.gate(self.attended, self.qgk_out, self.q_width)
+        else:
+            gated = self.attended * torch.sigmoid(
+                self.qgk_out[:, self.q_width:2 * self.q_width].float()).to(hidden.dtype)
+        attn = _reduced(self.attn_reduce, self.o_proj(gated))
         hidden, normed, _ = residual_norm(attn, hidden, w["post_attention_layernorm"],
                                           w["pre_feedforward_layernorm"], eps)
         self.gate_up(normed)
