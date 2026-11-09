@@ -14,6 +14,17 @@ numerics class B), but a row's result is the same at C1, C4 and in prefill.
 - `residual_norm`: optional `hidden + norm(delta, post)`, then `norm(., weight)` and the value lerp.
 - `qk_rope`: q/k RMSNorm per head, RoPE on sliding layers, and the q, key and value buffer writes.
 - `gate`: `attended * bf16(sigmoid(fp32(gate_logits)))`.
+
+On SM90+ every kernel launches programmatically (PDL, 2026-11-09): it may start while the previous kernel
+in the stream still runs. Before its `griddepcontrol.wait` it only warms the L2 lines of the inputs a
+latency-bound row walk would otherwise miss one after another (residual rows, norm gains, RoPE tables);
+L2 is the coherence point, so warming a line another grid may still write is a hint, never a stale read.
+Every load and store follows the wait, then the kernel releases the next programmatic launch. Values are
+unchanged (bitwise) with or without PDL.
+
+The launches are opaque custom ops with declared outputs: Inductor's mutation analysis of user Triton
+kernels cannot read the `griddepcontrol`/prefetch asm and would then treat every argument as written
+(extra clones, and wrong results where one buffer fills two parameters).
 """
 
 import torch
@@ -22,6 +33,33 @@ import triton.language as tl
 from torch._inductor.runtime.triton_helpers import libdevice
 
 _BLOCK = 1024
+
+
+def _pdl(tensor):
+    """Programmatic launches (and their pre-wait L2 warming) need SM90+."""
+    return torch.cuda.get_device_capability(tensor.device)[0] >= 9
+
+
+@triton.jit
+def _warm(address):
+    tl.inline_asm_elementwise("prefetch.global.L2 [$1];\n\tmov.u32 $0, 0;", "=r,l", [address.to(tl.int64)],
+                              dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
+def _warm_row(row, BYTES: tl.constexpr, ELEMENT: tl.constexpr, WIDTH: tl.constexpr):
+    """One L2 prefetch per 128-byte line of a contiguous row of BYTES (ELEMENT bytes each), WIDTH per pass."""
+    LINES: tl.constexpr = (BYTES + 127) // 128
+    for first in tl.static_range(0, LINES, WIDTH):
+        line = tl.minimum(first + tl.arange(0, WIDTH), LINES - 1)
+        _warm(row + line.to(tl.int64) * (128 // ELEMENT))
+
+
+@triton.jit
+def _enter(PDL: tl.constexpr):
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -38,8 +76,17 @@ def _sum_squares(row, HIDDEN: tl.constexpr, BLOCK: tl.constexpr):
 @triton.jit
 def _residual_norm(Delta, Hidden, PostWeight, NextWeight, Start, Blend, HiddenOut, NormedOut, LerpOut,
                    eps, factor, HIDDEN: tl.constexpr, DELTA: tl.constexpr, LERP: tl.constexpr,
-                   BLOCK: tl.constexpr):
+                   BLOCK: tl.constexpr, PDL: tl.constexpr = False):
     row = tl.program_id(0).to(tl.int64) * HIDDEN
+    if PDL:
+        # The residual row, the gains and the lerp start are each walked chunk by chunk below.
+        _warm_row(Hidden + row, HIDDEN * 2, 2, 128)
+        _warm_row(NextWeight, HIDDEN * 2, 2, 128)
+        if DELTA:
+            _warm_row(PostWeight, HIDDEN * 2, 2, 128)
+        if LERP:
+            _warm_row(Start + row, HIDDEN * 2, 2, 128)
+    _enter(PDL)
     columns = tl.arange(0, BLOCK)
     if DELTA:
         inverse = libdevice.rsqrt(_sum_squares(Delta + row, HIDDEN, BLOCK) * factor + eps)
@@ -87,24 +134,55 @@ def residual_norm(delta, hidden, post_weight, weight, eps, *, start=None, blend=
     lerp = start is not None
     if lerp != (blend is not None):
         raise ValueError("a value lerp needs both its start rows and its blend")
-    updated = hidden if delta is None else torch.empty_like(hidden)
-    normed = torch.empty_like(hidden)
-    lerped = torch.empty_like(hidden) if lerp else normed
-    torch.library.wrap_triton(_residual_norm)[(rows,)](
+    out = _residual_norm_rows(delta, hidden, post_weight, weight, start, blend, float(eps))
+    return hidden if delta is None else out[0], out[-2 if lerp else -1], out[-1] if lerp else None
+
+
+def _new_rows(delta, hidden, start):
+    return [torch.empty_like(hidden) for _ in range(1 + (delta is not None) + (start is not None))]
+
+
+@torch.library.custom_op("flare::ripple_residual_norm", mutates_args=())
+def _residual_norm_rows(delta: torch.Tensor | None, hidden: torch.Tensor, post_weight: torch.Tensor | None,
+                        weight: torch.Tensor, start: torch.Tensor | None, blend: torch.Tensor | None,
+                        eps: float) -> list[torch.Tensor]:
+    """New rows: the updated hidden (with a delta), the normed rows, then the lerp (with a start)."""
+    rows, width = hidden.shape
+    out = _new_rows(delta, hidden, start)
+    updated = hidden if delta is None else out[0]
+    normed = out[0 if delta is None else 1]
+    lerped = normed if start is None else out[-1]
+    pdl = _pdl(hidden)
+    _residual_norm[(rows,)](
         hidden if delta is None else delta, hidden, weight if post_weight is None else post_weight, weight,
-        start if lerp else hidden, blend if lerp else weight, updated, normed, lerped,
-        float(eps), 1.0 / width, width, delta is not None, lerp, _BLOCK, num_warps=4, enable_fp_fusion=False)
-    return updated, normed, lerped if lerp else None
+        hidden if start is None else start, weight if blend is None else blend, updated, normed, lerped,
+        eps, 1.0 / width, width, delta is not None, start is not None, _BLOCK, PDL=pdl, num_warps=4,
+        enable_fp_fusion=False, launch_pdl=pdl)
+    return out
+
+
+@_residual_norm_rows.register_fake
+def _fake_residual_norm_rows(delta, hidden, post_weight, weight, start, blend, eps):
+    return _new_rows(delta, hidden, start)
 
 
 @triton.jit
 def _qk_rope(QGK, V, QNorm, KNorm, Cos, Sin, Q, Key, Value, eps, factor, qgk_stride,
              HEADS: tl.constexpr, KV_HEADS: tl.constexpr, DIM: tl.constexpr, K_OFFSET: tl.constexpr,
-             ROPE: tl.constexpr):
+             ROPE: tl.constexpr, PDL: tl.constexpr = False):
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     HALF: tl.constexpr = DIM // 2
     half = tl.arange(0, HALF)
+    if PDL:
+        if head < HEADS:
+            _warm_row(QNorm, DIM * 2, 2, 4)
+        else:
+            _warm_row(KNorm, DIM * 2, 2, 4)
+        if ROPE:
+            _warm_row(Cos + token * DIM, DIM * 4, 4, 4)
+            _warm_row(Sin + token * DIM, DIM * 4, 4, 4)
+    _enter(PDL)
     if head < HEADS:
         source = QGK + token * qgk_stride + head * DIM
         gain = QNorm
@@ -143,15 +221,34 @@ def qk_rope(qgk, v, q_norm, k_norm, cos, sin, q, key, value, eps, *, rope):
         raise ValueError("q/k RoPE reads row-contiguous qgk and v")
     if rope and (cos.dtype != torch.float32 or cos.stride(0) != dim or sin.stride(0) != dim):
         raise ValueError("RoPE tables are contiguous FP32 rows of the head dimension")
-    torch.library.wrap_triton(_qk_rope)[(tokens, heads + kv_heads)](
+    _qk_rope_rows(qgk, v, q_norm, k_norm, cos if rope else None, sin if rope else None, q, key, value,
+                  float(eps))
+
+
+@torch.library.custom_op("flare::ripple_qk_rope", mutates_args=("q", "key", "value"))
+def _qk_rope_rows(qgk: torch.Tensor, v: torch.Tensor, q_norm: torch.Tensor, k_norm: torch.Tensor,
+                  cos: torch.Tensor | None, sin: torch.Tensor | None, q: torch.Tensor, key: torch.Tensor,
+                  value: torch.Tensor, eps: float) -> None:
+    """The q/k RoPE launch (RoPE when the tables are given)."""
+    tokens, heads, dim = q.shape
+    kv_heads = key.shape[1]
+    rope = cos is not None
+    pdl = _pdl(qgk)
+    _qk_rope[(tokens, heads + kv_heads)](
         qgk, v, q_norm, k_norm, cos if rope else q_norm, sin if rope else q_norm, q, key, value,
-        float(eps), 1.0 / dim, qgk.stride(0), heads, kv_heads, dim, 2 * heads * dim, rope,
-        num_warps=1, enable_fp_fusion=False)
+        eps, 1.0 / dim, qgk.stride(0), heads, kv_heads, dim, 2 * heads * dim, rope, PDL=pdl,
+        num_warps=1, enable_fp_fusion=False, launch_pdl=pdl)
+
+
+@_qk_rope_rows.register_fake
+def _fake_qk_rope_rows(qgk, v, q_norm, k_norm, cos, sin, q, key, value, eps):
+    pass
 
 
 @triton.jit
 def _gate(Attended, QGK, Out, a_stride, qgk_stride, G_OFFSET: tl.constexpr, WIDTH: tl.constexpr,
-          BLOCK: tl.constexpr):
+          BLOCK: tl.constexpr, PDL: tl.constexpr = False):
+    _enter(PDL)
     token = tl.program_id(0).to(tl.int64)
     index = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     valid = index < WIDTH
@@ -161,12 +258,19 @@ def _gate(Attended, QGK, Out, a_stride, qgk_stride, G_OFFSET: tl.constexpr, WIDT
     tl.store(Out + token * WIDTH + index, (attended * gate).to(tl.bfloat16), valid)
 
 
-def gate(attended, qgk, offset):
+@torch.library.custom_op("flare::ripple_gate", mutates_args=())
+def gate(attended: torch.Tensor, qgk: torch.Tensor, offset: int) -> torch.Tensor:
     """`attended * bf16(sigmoid(fp32(qgk[:, offset:offset + width])))` as new contiguous rows."""
     tokens, width = attended.shape
-    out = torch.empty((tokens, width), dtype=attended.dtype, device=attended.device)
+    out = attended.new_empty((tokens, width))
     block = 1024
-    torch.library.wrap_triton(_gate)[(tokens, triton.cdiv(width, block))](
-        attended, qgk, out, attended.stride(0), qgk.stride(0), offset, width, block, num_warps=4,
-        enable_fp_fusion=False)
+    pdl = _pdl(attended)
+    _gate[(tokens, triton.cdiv(width, block))](
+        attended, qgk, out, attended.stride(0), qgk.stride(0), offset, width, block, PDL=pdl, num_warps=4,
+        enable_fp_fusion=False, launch_pdl=pdl)
     return out
+
+
+@gate.register_fake
+def _fake_gate(attended, qgk, offset):
+    return attended.new_empty(attended.shape)
