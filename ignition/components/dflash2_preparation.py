@@ -42,7 +42,8 @@ class DFlash2Preparation:
             raise ValueError("DFlash2 proposal block must cover the verification width through sixteen tokens")
         self.block_size, self.logit_offset = block_size, 1
         self.draft_scratch = DraftScratch.allocate(weights.config.draft, weights.shard,
-            requests.capacity * block_size, pool.backing.device, buffers=buffers, block_size=block_size)
+            requests.capacity * block_size, pool.backing.device, buffers=buffers, block_size=block_size,
+            full_context=getattr(pool, "draft_full_context", False))
 
     def scratch_tensors(self):
         from .parallel_draft import PreparedParallelDraftRound

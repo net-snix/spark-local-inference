@@ -16,6 +16,10 @@ history. Prefill chunks are wider than a ring; they stage the window in scratch 
 (see `window.py`) and commit the last R pages back.
 
 KV is BF16, the precision the reference server uses, unless the package selects E4M3.
+
+With DFlash2, each page record also holds the context keys and values of the drafter's
+full-attention layer, so that layer reads the request's whole history through the target's
+page tables; the drafter's sliding layers keep FP8 rings of their window in each row.
 """
 
 import torch
@@ -50,16 +54,20 @@ def page_record(config, shard, kv_dtype=KV_DTYPE) -> int:
     return PAGE_TOKENS * config.local_kv_heads(shard) * config.head_dim * kv_dtype.itemsize
 
 
-def page_specs(config, shard: TensorParallelShard = TensorParallelShard(0, 1), kv_dtype=KV_DTYPE):
+def page_specs(config, shard: TensorParallelShard = TensorParallelShard(0, 1), kv_dtype=KV_DTYPE, *, draft=False):
     size = page_record(config, shard, kv_dtype)
     for index in range(config.num_layers):
         if not config.is_sliding(index):
             for field in ("key", "value"):
                 yield f"layer{index}.{field}", (size,)
+    if draft:
+        from ignition.components.dflash2_geometry import draft_page_specs
+
+        yield from draft_page_specs(config.draft, shard, PAGE_TOKENS, kv_dtype)
 
 
-def page_bytes(config, shard: TensorParallelShard = TensorParallelShard(0, 1), kv_dtype=KV_DTYPE):
-    return sum(shape[0] for _, shape in page_specs(config, shard, kv_dtype))
+def page_bytes(config, shard: TensorParallelShard = TensorParallelShard(0, 1), kv_dtype=KV_DTYPE, *, draft=False):
+    return sum(shape[0] for _, shape in page_specs(config, shard, kv_dtype, draft=draft))
 
 
 def continuation_layout(config, shard: TensorParallelShard = TensorParallelShard(0, 1), *, draft=False,
@@ -72,12 +80,12 @@ def continuation_layout(config, shard: TensorParallelShard = TensorParallelShard
     regions = [(f"layer{index}.{field}", (ring, heads, config.head_dim), kv_dtype)
                for index in range(config.num_layers) if config.is_sliding(index) for field in ("key", "value")]
     # A full-attention layer's partial page travels with snapshots of the row.
-    regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config, shard, kv_dtype))
+    regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config, shard, kv_dtype, draft=draft))
     if draft:
         from ignition.components.dflash2_geometry import draft_context_specs
 
-        # Each continuation keeps the drafter's FP8 accepted-context rings beside its pages.
-        regions.extend(draft_context_specs(config.draft, shard))
+        # Each continuation keeps the drafter's sliding layers' FP8 accepted-context rings beside its pages.
+        regions.extend(draft_context_specs(config.draft, shard, paged=config.draft.full_attention_layers))
     regions.extend((("last_hidden", (config.hidden,), torch.bfloat16),
                     ("consumed_tokens", (1,), torch.int64)))
     layout = StateLayout.from_specs(regions)
@@ -91,7 +99,22 @@ class ContinuationPool(PagedStateStorage):
     def for_model(cls, config, slots, pages, device, *, shard: TensorParallelShard = TensorParallelShard(0, 1),
                   draft=False, kv_dtype=KV_DTYPE, **kwargs):
         return cls.allocate(continuation_layout(config, shard, draft=draft, kv_dtype=kv_dtype),
-                            page_specs(config, shard, kv_dtype), slots, pages, device, **kwargs)
+                            page_specs(config, shard, kv_dtype, draft=draft), slots, pages, device, **kwargs)
+
+    @property
+    def draft_full_context(self):
+        """Whether the drafter's full-attention layers keep their context in page records."""
+        return any(name.startswith("draft") for name in self.pages)
+
+    def draft_pages(self, layer):
+        """Context key and value pages of one draft layer, or None when it reads a ring."""
+        if f"draft{layer}.key" not in self.pages:
+            return None
+        ring = self._ring(next(int(r.name[5:].split(".")[0]) for r in self.layout.regions
+                               if r.name.startswith("layer") and r.dtype != torch.uint8))
+        heads, dim = ring.shape[1:]
+        return tuple(self.pages[f"draft{layer}.{field}"].view(self.kv_dtype).view(-1, PAGE_TOKENS, heads, dim)
+                     for field in ("key", "value"))
 
     def _ring(self, layer):
         return self.layout.region(f"layer{layer}.key")

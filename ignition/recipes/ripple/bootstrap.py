@@ -174,7 +174,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     prep_pages = config.prefill_chunk_size // PAGE_TOKENS + 2 * slots
     pages = max(prep_pages, config.minimum_pages)
     initial_pages = prep_pages if package_storage is not None else pages
-    bytes_per_page = page_bytes(weights.config, shard, kv_dtype)
+    bytes_per_page = page_bytes(weights.config, shard, kv_dtype, draft=config.mtp)
     total_memory = minimum_across_ranks(torch.cuda.mem_get_info(device)[1], group)
     with phase(progress, "Allocate model state"):
         pool = ContinuationPool.for_model(weights.config, state_rows + 1, initial_pages, device, shard=shard,
@@ -296,7 +296,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                                           buffers=cursor)
                     absorption = (partial(PreparedContext, runtime=gather_collective, coordinator=coordinator,
-                        buffers=context_buffers.cursor(), compact_prefill=mode == "prefill") if enabled else None)
+                        buffers=context_buffers.cursor(),
+                        compact_prefill=mode == "prefill" and not pool.draft_full_context) if enabled else None)
                     forward = PreparedGeneration(decoder, batch, completion, frame, sequence, runtime=collective,
                         coordinator=coordinator, session=session, name=name + ".generation", workspace=arena,
                         buffers=cursor, context_factory=absorption)

@@ -199,10 +199,11 @@ def test_pages_and_state_rows_match_declared_costs(drafted, world, drafting):
     costs = recipe.costs(world, recipe.speculation if drafting else None)
     layout = continuation_layout(drafted, shard, draft=drafting)
     assert layout.row_bytes == costs.state_row_bytes
-    assert page_bytes(drafted, shard) == costs.page_bytes == 16 * 2 * 128 * (8 // world) * 128 * 2
+    paged = 17 if drafting else 16
+    assert page_bytes(drafted, shard, draft=drafting) == costs.page_bytes == paged * 2 * 128 * (8 // world) * 128 * 2
     pool = ContinuationPool.for_model(drafted, 3, 2, "meta", shard=shard, draft=drafting)
     assert pool.layout.row_bytes == costs.state_row_bytes
-    assert len(pool.pages) == 32 and sum(page[0].nbytes for page in pool.pages.values()) == costs.page_bytes
+    assert len(pool.pages) == 2 * paged and sum(page[0].nbytes for page in pool.pages.values()) == costs.page_bytes
     assert pool.kv_dtype == KV_DTYPE and pool.ring_pages == (10 if drafting else 9)
     for layer in (0, 4, 79):
         for cache in pool.attention(layer, drafted, shard):
@@ -210,8 +211,8 @@ def test_pages_and_state_rows_match_declared_costs(drafted, world, drafting):
     rows = pool.row_pages(drafted, shard)
     assert pool.attention(0, drafted, shard)[0].shape[0] == 2 * rows + pool.ring_pages
     assert pool.attention(4, drafted, shard)[0].shape[0] == 2
-    rings = [region for region in layout.regions if region.name.startswith("draft")]
-    assert len(rings) == (10 if drafting else 0)
+    rings = [region for region in layout.regions if region.name.startswith("draft") and region.dtype != torch.uint8]
+    assert len(rings) == (8 if drafting else 0)
     for region in rings:
         ring = pool.reserved_region(region.name)
         assert ring.shape == (3, 4096, 8 // world, 128) and ring.dtype == torch.float8_e4m3fn
@@ -219,14 +220,35 @@ def test_pages_and_state_rows_match_declared_costs(drafted, world, drafting):
     assert pool.reserved_region("consumed_tokens").dtype == torch.int64
 
 
-def test_draft_costs_add_rings_and_a_ring_page():
+def test_draft_costs_add_rings_a_ring_page_and_the_paged_full_layer():
     recipe = MODEL.recipe
     for world in (1, 2, 4):
         plain, drafting = recipe.costs(world, None), recipe.costs(world, recipe.speculation)
-        assert drafting.page_bytes == plain.page_bytes and drafting.graph_bytes == plain.graph_bytes
         record = 128 * (8 // world) * 128 * 2
-        # Sixteen-token rounds keep one more ring page per sliding layer than single tokens.
-        assert drafting.state_row_bytes - plain.state_row_bytes == 5 * 2 * 4096 * (8 // world) * 128 + 128 * record
+        # The drafter's full-attention layer keeps its context keys and values in every page record.
+        assert drafting.page_bytes == plain.page_bytes + 2 * record and drafting.graph_bytes == plain.graph_bytes
+        # Sixteen-token rounds keep one more ring page per sliding layer than single tokens; the four
+        # sliding draft layers keep FP8 rings, the full one a partial page.
+        assert drafting.state_row_bytes - plain.state_row_bytes == (
+            4 * 2 * 4096 * (8 // world) * 128 + 128 * record + 2 * record)
+
+
+def test_ripple_pool_pages_the_full_attention_draft_layer(drafted):
+    from ignition.components.parallel import TensorParallelShard
+    from ignition.recipes.ripple.pool import ContinuationPool, continuation_layout
+
+    shard = TensorParallelShard(0, 1)
+    pool = ContinuationPool.for_model(drafted, 3, 2, "meta", shard=shard, draft=True)
+    assert pool.draft_full_context
+    assert drafted.draft.full_attention_layers == (4,)
+    keys, values = pool.draft_pages(4)
+    assert keys.shape == values.shape == (2, 128, 8, 128) and keys.dtype == torch.bfloat16
+    assert all(pool.draft_pages(layer) is None for layer in range(4))
+    names = {region.name for region in continuation_layout(drafted, shard, draft=True).regions}
+    # Sliding draft layers keep rings; the full layer's partial page travels with the row instead.
+    assert {f"draft{layer}.key" for layer in range(5)} <= names
+    plain = ContinuationPool.for_model(drafted, 3, 2, "meta", shard=shard, draft=False)
+    assert not plain.draft_full_context and plain.draft_pages(4) is None
 
 
 def test_window_pages_bound_every_round(target):
@@ -252,7 +274,7 @@ def test_fp8_kv_costs_match_the_layout(drafted, kv_dtype):
             costs = MODEL.recipe.costs(world, MODEL.recipe.speculation if drafting else None,
                                        checkpoint if kv_dtype == torch.float8_e4m3fn else None)
             assert continuation_layout(drafted, shard, draft=drafting, kv_dtype=kv_dtype).row_bytes == costs.state_row_bytes
-            assert page_bytes(drafted, shard, kv_dtype) == costs.page_bytes
+            assert page_bytes(drafted, shard, kv_dtype, draft=drafting) == costs.page_bytes
 
 
 class _Buffers:
