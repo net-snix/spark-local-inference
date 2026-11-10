@@ -35,9 +35,14 @@ from torch._inductor.runtime.triton_helpers import libdevice
 _BLOCK = 1024
 
 
+# Decode-sized launches only (2026-11-10): prefill chunks gain nothing from an early launch, and the
+# pre-wait warming of thousands of rows competes with the GEMM still running (WS PDL build: prefill -1.2%).
+_PDL_MAX_ROWS = 64
+
+
 def _pdl(tensor):
-    """Programmatic launches (and their pre-wait L2 warming) need SM90+."""
-    return torch.cuda.get_device_capability(tensor.device)[0] >= 9
+    """Programmatic launches (and their pre-wait L2 warming) need SM90+, for decode-sized row counts."""
+    return tensor.shape[0] <= _PDL_MAX_ROWS and torch.cuda.get_device_capability(tensor.device)[0] >= 9
 
 
 @triton.jit
