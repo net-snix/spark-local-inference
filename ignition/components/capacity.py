@@ -37,16 +37,12 @@ def image_capacity(concurrency: int, capacity: int | None = None) -> int:
     return capacity
 
 
-def prefill_capacities(chunk_size: int, *, midpoints: bool = False) -> tuple[int, ...]:
+def prefill_capacities(chunk_size: int) -> tuple[int, ...]:
     """Token capacities offered to Helios for prompt chunk scheduling.
 
     Capacities double from 128 tokens to a step of at least 512 tokens and about an eighth of the
     chunk, then grow by that step, so a partial chunk pads by less than one step; the chunk size
     itself is last. Helios's `prefill_capacities` must agree.
-
-    `midpoints` adds the midpoint of every gap that still doubles (192, 384, 768). A short agent
-    turn is one launch, and padding it to twice its size costs half of that launch. Helios takes
-    this catalog from the package's prefill graphs, so only the recipe opts in.
     """
     step = max(512, chunk_size // 8 // 512 * 512)
     capacities, capacity = [], 128
@@ -57,11 +53,7 @@ def prefill_capacities(chunk_size: int, *, midpoints: bool = False) -> tuple[int
     while capacity < chunk_size:
         capacities.append(capacity)
         capacity += step
-    capacities.append(chunk_size)
-    if midpoints:
-        capacities = sorted({*capacities, *(low + low // 2 for low, high in zip(capacities, capacities[1:])
-                                            if high >= 2 * low)})
-    return tuple(capacities)
+    return (*capacities, chunk_size)
 
 
 def batch_capacities(concurrency: int) -> tuple[int, ...]:
