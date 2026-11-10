@@ -152,3 +152,25 @@ def test_gate_matches_staged(tokens):
     want = attended * torch.sigmoid(qgk[:, HEADS * DIM:2 * HEADS * DIM].float()).bfloat16()
     got = gate(attended, qgk, HEADS * DIM)
     assert _ulps(got, want) <= 1
+
+
+@pytest.mark.parametrize("rows", (1, 9, 16, 64, 2048))
+@pytest.mark.parametrize("mode", ("plain", "delta", "lerp", "delta_lerp"))
+def test_residual_norm_registers_bitwise(rows, mode, monkeypatch):
+    """The register-resident 5120-wide kernel stores exactly what the chunk-walking kernel stores."""
+    from ignition.recipes.ripple import glue
+
+    generator = torch.Generator(device="cuda").manual_seed(rows * 7 + len(mode))
+    hidden = _rows(rows, HIDDEN, 4.0, generator)
+    delta = _rows(rows, HIDDEN, 0.02, generator) if "delta" in mode else None
+    start = _rows(rows, HIDDEN, 1.0, generator) if "lerp" in mode else None
+    blend = torch.tensor([0.73 if rows % 2 else 0.31], device="cuda").bfloat16() if start is not None else None
+    hidden[0, :7] = torch.tensor([0., -0., 1e-30, -1e-30, 3e4, -3e4, 1.], device="cuda").bfloat16()
+    post, weight = _gain(HIDDEN, generator), _gain(HIDDEN, generator)
+    args = (delta, hidden, post if delta is not None else None, weight, start, blend, EPS)
+    new = glue._residual_norm_rows(*args)
+    monkeypatch.setattr(glue, "_ROW_CHUNKS", 0)
+    old = glue._residual_norm_rows(*args)
+    assert len(new) == len(old)
+    for got, want in zip(new, old):
+        assert torch.equal(got.view(torch.int16), want.view(torch.int16))

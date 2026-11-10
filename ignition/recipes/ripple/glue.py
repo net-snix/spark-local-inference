@@ -11,7 +11,8 @@ FP32 sigmoid gate rounded to BF16) with one fixed FP32 summation order per row t
 on how many rows the launch has. They are not bit-identical to ATen's mean (accumulation order only:
 numerics class B), but a row's result is the same at C1, C4 and in prefill.
 
-- `residual_norm`: optional `hidden + norm(delta, post)`, then `norm(., weight)` and the value lerp.
+- `residual_norm`: optional `hidden + norm(delta, post)`, then `norm(., weight)` and the value lerp
+  (5120-wide rows stay in registers: `_residual_norm5`, bit-identical, 2026-11-10).
 - `qk_rope`: q/k RMSNorm per head, RoPE on sliding layers, the q write, and key/value into their
   buffers or straight into their cache slots (2026-11-10, replaces the paged KV writer launch).
 - `gate`: `attended * bf16(sigmoid(fp32(gate_logits)))`.
@@ -130,6 +131,95 @@ def _residual_norm(Delta, Hidden, PostWeight, NextWeight, Start, Blend, HiddenOu
             tl.store(LerpOut + row + index, lerped.to(tl.bfloat16), valid)
 
 
+# Hidden 5120 = 5 x _BLOCK (Ripple): the row stays in registers (2026-11-10). Each lane sums its five chunk
+# squares in chunk order and tl.sum reduces the same 1024-lane layout as `_sum_squares`, so the result is
+# bit-identical to `_residual_norm` while every input row is read once instead of once per pass.
+_ROW_CHUNKS = 5
+
+
+@triton.jit
+def _load5(row, columns, BLOCK: tl.constexpr):
+    return (tl.load(row + columns).to(tl.float32), tl.load(row + BLOCK + columns).to(tl.float32),
+            tl.load(row + 2 * BLOCK + columns).to(tl.float32), tl.load(row + 3 * BLOCK + columns).to(tl.float32),
+            tl.load(row + 4 * BLOCK + columns).to(tl.float32))
+
+
+@triton.jit
+def _sum_squares5(x0, x1, x2, x3, x4):
+    # `_sum_squares` starts from zeros: 0 + x * x == x * x bit for bit (x * x is never -0).
+    acc = x0 * x0
+    acc = acc + x1 * x1
+    acc = acc + x2 * x2
+    acc = acc + x3 * x3
+    acc = acc + x4 * x4
+    return tl.sum(acc, axis=0)
+
+
+@triton.jit
+def _updated(delta, inverse, weight, residual):
+    normalized = (delta * inverse).to(tl.bfloat16).to(tl.float32)
+    update = (weight * normalized).to(tl.bfloat16).to(tl.float32)
+    return (residual + update).to(tl.bfloat16)
+
+
+@triton.jit
+def _normed(value, inverse, weight, Out, Start, LerpOut, offset, coefficient, far, LERP: tl.constexpr):
+    normalized = (value * inverse).to(tl.bfloat16).to(tl.float32)
+    output = (weight * normalized).to(tl.bfloat16)
+    tl.store(Out + offset, output)
+    if LERP:
+        end = output.to(tl.float32)
+        start = tl.load(Start + offset).to(tl.float32)
+        lerped = tl.fma(coefficient, end - start, tl.where(far, end, start))
+        tl.store(LerpOut + offset, lerped.to(tl.bfloat16))
+
+
+@triton.jit
+def _residual_norm5(Delta, Hidden, PostWeight, NextWeight, Start, Blend, HiddenOut, NormedOut, LerpOut,
+                    eps, factor, HIDDEN: tl.constexpr, DELTA: tl.constexpr, LERP: tl.constexpr,
+                    BLOCK: tl.constexpr, PDL: tl.constexpr = False):
+    row = tl.program_id(0).to(tl.int64) * HIDDEN
+    if PDL:
+        _warm_row(Hidden + row, HIDDEN * 2, 2, 128)
+        _warm_row(NextWeight, HIDDEN * 2, 2, 128)
+        if DELTA:
+            _warm_row(PostWeight, HIDDEN * 2, 2, 128)
+        if LERP:
+            _warm_row(Start + row, HIDDEN * 2, 2, 128)
+    _enter(PDL)
+    c = tl.arange(0, BLOCK)
+    h0, h1, h2, h3, h4 = _load5(Hidden + row, c, BLOCK)
+    if DELTA:
+        d0, d1, d2, d3, d4 = _load5(Delta + row, c, BLOCK)
+        p0, p1, p2, p3, p4 = _load5(PostWeight, c, BLOCK)
+        inverse = libdevice.rsqrt(_sum_squares5(d0, d1, d2, d3, d4) * factor + eps)
+        u0 = _updated(d0, inverse, p0, h0)
+        u1 = _updated(d1, inverse, p1, h1)
+        u2 = _updated(d2, inverse, p2, h2)
+        u3 = _updated(d3, inverse, p3, h3)
+        u4 = _updated(d4, inverse, p4, h4)
+        tl.store(HiddenOut + row + c, u0)
+        tl.store(HiddenOut + row + BLOCK + c, u1)
+        tl.store(HiddenOut + row + 2 * BLOCK + c, u2)
+        tl.store(HiddenOut + row + 3 * BLOCK + c, u3)
+        tl.store(HiddenOut + row + 4 * BLOCK + c, u4)
+        h0, h1, h2, h3, h4 = u0.to(tl.float32), u1.to(tl.float32), u2.to(tl.float32), u3.to(tl.float32), \
+            u4.to(tl.float32)
+    inverse = libdevice.rsqrt(_sum_squares5(h0, h1, h2, h3, h4) * factor + eps)
+    coefficient = 0.
+    far = False
+    if LERP:
+        blend = tl.load(Blend).to(tl.float32)
+        far = tl.abs(blend) >= 0.5
+        coefficient = tl.where(far, -(1.0 - blend), blend)
+    w0, w1, w2, w3, w4 = _load5(NextWeight, c, BLOCK)
+    _normed(h0, inverse, w0, NormedOut, Start, LerpOut, row + c, coefficient, far, LERP)
+    _normed(h1, inverse, w1, NormedOut, Start, LerpOut, row + BLOCK + c, coefficient, far, LERP)
+    _normed(h2, inverse, w2, NormedOut, Start, LerpOut, row + 2 * BLOCK + c, coefficient, far, LERP)
+    _normed(h3, inverse, w3, NormedOut, Start, LerpOut, row + 3 * BLOCK + c, coefficient, far, LERP)
+    _normed(h4, inverse, w4, NormedOut, Start, LerpOut, row + 4 * BLOCK + c, coefficient, far, LERP)
+
+
 def residual_norm(delta, hidden, post_weight, weight, eps, *, start=None, blend=None):
     """Same contract as `decoder.staged_residual_norm`: (hidden after the update, normed, lerp or None)."""
     rows, width = hidden.shape
@@ -159,7 +249,8 @@ def _residual_norm_rows(delta: torch.Tensor | None, hidden: torch.Tensor, post_w
     normed = out[0 if delta is None else 1]
     lerped = normed if start is None else out[-1]
     pdl = _pdl(hidden)
-    _residual_norm[(rows,)](
+    kernel = _residual_norm5 if width == _ROW_CHUNKS * _BLOCK else _residual_norm
+    kernel[(rows,)](
         hidden if delta is None else delta, hidden, weight if post_weight is None else post_weight, weight,
         hidden if start is None else start, weight if blend is None else blend, updated, normed, lerped,
         eps, 1.0 / width, width, delta is not None, start is not None, _BLOCK, PDL=pdl, num_warps=4,
