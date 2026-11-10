@@ -362,10 +362,19 @@ def test_rings_and_staged_prefill_read_exact_window_history(drafted):
             ends[request] += int(torch.randint(1, width + 1, (), generator=generator))
 
 
+def test_proposal_temperatures_cover_the_draft_block():
+    from ignition.recipes.ripple import draft_config
+
+    temperatures = draft_config.PROPOSAL_TEMPERATURES
+    assert len(temperatures) == draft_config.PROFILE["dflash_config"]["block_size"]
+    assert temperatures[0] == 1. and all(0 < value < 2 for value in temperatures)
+
+
 def test_real_draft_config_geometry(target):
     from ignition.recipes.ripple import draft_config
 
     draft = draft_config.load(draft_snapshot(), target)
+    assert draft.proposal_temperatures == draft_config.PROPOSAL_TEMPERATURES
     assert draft.rotary_layers == (True, True, True, True, False)
     assert draft.full_attention_layers == (4,)
     assert draft.convolution == (4, 16)

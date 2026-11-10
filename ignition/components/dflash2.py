@@ -342,7 +342,7 @@ class PreparedDraft:
         if selector_key not in s.selectors:
             selector = PreparedCandidateSelector(s.hidden.view(-1, s.block_size, s.hidden.shape[-1]),
                 weights.draft.selector, top_k=c.text["dflash_config"]["selector_top_k"], session=session,
-                name=name + ".selector")
+                name=name + ".selector", temperatures=getattr(c, "proposal_temperatures", None))
             s.selectors[selector_key] = selector
             s.retained.append(selector.projected)
         self.selector = s.selectors[selector_key]

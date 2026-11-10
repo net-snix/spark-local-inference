@@ -29,6 +29,8 @@ class DFlash2Config:
     """Validated block drafter geometry and its target feature contract."""
 
     text: dict
+    # Candidate-selector proposal temperature per block position; None keeps the drafter's own scores.
+    proposal_temperatures: tuple | None = None
 
     @classmethod
     def load(cls, snapshot, **kwargs):

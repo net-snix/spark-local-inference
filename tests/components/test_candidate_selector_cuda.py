@@ -22,7 +22,15 @@ def test_batched_shortlist_compiled_control(batch):
     _check_shortlist_replay(batch, compiled_control=True)
 
 
-def _check_shortlist_replay(batch, *, compiled_control):
+@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize("compiled_control", [False, True])
+@torch.no_grad()
+def test_batched_shortlist_proposal_temperatures(batch, compiled_control):
+    _check_shortlist_replay(batch, compiled_control=compiled_control,
+                            temperatures=(1., 1.15, 1., .95, .9, .85, .8, .75))
+
+
+def _check_shortlist_replay(batch, *, compiled_control, temperatures=None):
     torch.manual_seed(913)
     vocab, width, rank = 248320, 8, 256
     selector = object.__new__(PreparedCandidateSelector)
@@ -32,6 +40,10 @@ def _check_shortlist_replay(batch, *, compiled_control):
     selector.projected = torch.randn((batch, width, rank), device='cuda', dtype=torch.bfloat16)
     selector.unary = torch.empty((batch, width, 16), device='cuda', dtype=torch.float32)
     selector.ids = torch.empty((batch, width, 16), device='cuda', dtype=torch.int64)
+    if temperatures is not None:
+        from ignition.components.candidate_selector import proposal_scales
+
+        selector.scales = proposal_scales(temperatures, width, 'cuda')
     source = torch.empty((batch, width, vocab), device='cuda', dtype=torch.float32)
     predecessor = torch.arange(batch, device='cuda', dtype=torch.int64)
     output = torch.empty((batch, width - 1, vocab), device='cuda', dtype=torch.float32)
@@ -81,6 +93,9 @@ def _check_shortlist_replay(batch, *, compiled_control):
             coded = selector.weights["predecessor"][predecessor] * selector.projected[:, position]
             correction = torch.bmm(selector.weights["successor"][ids], coded.unsqueeze(-1)).squeeze(-1)
             logits.fill_(-torch.inf)
-            logits.scatter_(1, ids, unary + correction.float())
+            scores = unary + correction.float()
+            if temperatures is not None:
+                scores = scores * torch.tensor(temperatures[position], dtype=torch.float32).reciprocal().cuda()
+            logits.scatter_(1, ids, scores)
             reference[:, position - 1].copy_(logits)
         torch.testing.assert_close(output, reference, rtol=0, atol=0, equal_nan=True)
