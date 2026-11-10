@@ -134,7 +134,7 @@ def attend(query, key_pages, value_pages, page_table, starts, lengths, query_sta
         accumulators, lse, query.stride(0), query.stride(1), key_pages.stride(0), key_pages.stride(1),
         key_pages.stride(2), page_table.stride(0), block_key.stride(0), block_key.stride(1),
         accumulators.stride(0), accumulators.stride(1), accumulators.stride(2), lse.stride(0), lse.stride(1),
-        dim ** -0.5, group, HEAD_CHUNK, rows, dim, key_pages.shape[1], SPLITS, num_warps=4, num_stages=2)
+        dim ** -0.5, group, HEAD_CHUNK, rows, dim, key_pages.shape[1], SPLITS, num_warps=8, num_stages=2)
     wrap(_merge)[(requests, heads)](
         accumulators, lse, lengths, query_start, output, accumulators.stride(0), accumulators.stride(1),
         accumulators.stride(2), lse.stride(0), lse.stride(1), output.stride(0), output.stride(1),
