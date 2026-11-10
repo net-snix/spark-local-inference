@@ -18,6 +18,9 @@ from .speculation import (
 )
 from .state import save_hidden
 
+# Shortlisted DFlash2 proposals run their whole position chain in one launch (shortlist_chain.py).
+SHORTLIST_CHAIN = True
+
 
 def prepare_sampling_scratch(batch, width, vocab, device, *, buffers=None, proposal=True, verification=True):
     """Share sequential sampling stages and retain target results through verification.
@@ -198,6 +201,7 @@ class PreparedParallelDraftRound:
             torch.zeros_like(self.before) for _ in range(4)
         )
         self.operations = None
+        self.chain = None
         self.proposal_block = None
         self.full_proposal = None
 
@@ -276,6 +280,15 @@ class PreparedParallelDraftRound:
                 runtime=runtime, session=o.session, coordinator=o.collectives["coordinator"],
                 name=self.name + ".proposal_block", buffers=self.buffers)
             broadcast_proposals = ()
+        if (proposals and SHORTLIST_CHAIN and self.proposal_block is None and self.full_proposal is None
+                and self.shortlisted_selector is not None and self.markov is None):
+            from .shortlist_chain import PreparedShortlistChain
+
+            self.chain = PreparedShortlistChain(self.shortlisted_selector, self.markov_token, o.requests,
+                o.inputs.row_slot_ids[:b], o.inputs.row_generations[:b], o.inputs.live_rows, self.seed,
+                self.base_offset, self.active, o.inputs.query_lengths[:b], self.probabilities, self.valid,
+                self.drafts, self.sampled, logit_offset=o.logit_offset)
+            self.chain.prepare()
         if self.proposal_only:
             prepare_sampling_broadcasts(broadcast_proposals, None, collectives=o.collectives, session=o.session,
                                         name=self.name, buffers=self.buffers,
@@ -406,31 +419,36 @@ class PreparedParallelDraftRound:
                     self.valid.logical_and_(self.active[:, None] & (self.draft_positions[None, :] < limits[:, None] - 1))
                     self.sampled.copy_(self.drafts[:, -1])
                     self.markov_token.copy_(self.sampled)
-            for i, proposal in enumerate(proposals):
-                if proposal.source_logits is not None:
-                    if self.markov is not None:
-                        self.markov()
-                else:
-                    self.logits[:, 0].copy_(
-                        self.draft.scratch.logits.view(b, block, -1)[:, i + o.logit_offset].float()
-                    )
-                    if self.markov is not None:
-                        self.logits[:, 0].add_(self.markov())
-                    if self.shortlisted_selector is not None:
-                        self.shortlisted_selector.apply_shortlist(self.logits[:, 0], self.markov_token, i + o.logit_offset)
-                    elif self.selector is not None:
-                        self.selector(self.logits[:, 0], self.markov_token, i + o.logit_offset)
-                if observer is not None:
-                    observer.record_embedding(i, self.markov.embedding)
-                self.offset.copy_(self.base_offset + 4 * i)
-                proposal()
-                self.drafts[:, i].copy_(self.sampled)
-                if self.proposal_block is None:
-                    self.probabilities[:, i].copy_(proposal.probabilities[:, 0])
-                    self.valid[:, i].copy_(proposal.valid[:, 0] & self.active & (i < limits - 1))
-                else:
-                    self.proposal_block.retain(i, proposal)
+            if self.chain is not None and observer is None:
+                self.chain()
+                self.offset.copy_(self.base_offset + 4 * (len(proposals) - 1))
                 self.markov_token.copy_(self.sampled)
+            else:
+                for i, proposal in enumerate(proposals):
+                    if proposal.source_logits is not None:
+                        if self.markov is not None:
+                            self.markov()
+                    else:
+                        self.logits[:, 0].copy_(
+                            self.draft.scratch.logits.view(b, block, -1)[:, i + o.logit_offset].float()
+                        )
+                        if self.markov is not None:
+                            self.logits[:, 0].add_(self.markov())
+                        if self.shortlisted_selector is not None:
+                            self.shortlisted_selector.apply_shortlist(self.logits[:, 0], self.markov_token, i + o.logit_offset)
+                        elif self.selector is not None:
+                            self.selector(self.logits[:, 0], self.markov_token, i + o.logit_offset)
+                    if observer is not None:
+                        observer.record_embedding(i, self.markov.embedding)
+                    self.offset.copy_(self.base_offset + 4 * i)
+                    proposal()
+                    self.drafts[:, i].copy_(self.sampled)
+                    if self.proposal_block is None:
+                        self.probabilities[:, i].copy_(proposal.probabilities[:, 0])
+                        self.valid[:, i].copy_(proposal.valid[:, 0] & self.active & (i < limits - 1))
+                    else:
+                        self.proposal_block.retain(i, proposal)
+                    self.markov_token.copy_(self.sampled)
             if self.proposal_block is not None:
                 self.proposal_block.finish(self.active, limits)
                 self.markov_token.copy_(self.sampled)
