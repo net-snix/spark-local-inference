@@ -82,14 +82,16 @@ def _reference(x, monkeypatch):
     from ignition.recipes.ripple import glue
 
     with monkeypatch.context() as m:
-        m.setattr(glue, "_pdl", lambda tensor: False)
+        m.setattr(glue, "_pdl", lambda tensor, rows: False)
         return _forward(x)
 
 
 def test_glue_launches_programmatically():
     from ignition.recipes.ripple import glue
 
-    assert glue._pdl(torch.empty(1, device="cuda"))
+    probe = torch.empty(1, device="cuda")
+    assert glue._pdl(probe, ROWS) and glue._pdl(probe, 64)
+    assert not glue._pdl(probe, 128)  # prefill-size launches stay plain
 
 
 def test_pdl_glue_is_bitwise_equal(monkeypatch):

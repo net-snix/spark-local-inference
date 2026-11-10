@@ -81,6 +81,8 @@ def _reference(a, w, s, rows, n, k, tile_m, tile_n, tile_k, split, warps):
 def test_plan_compiles_programmatic_launches():
     programs, _ = _plan(6, 5120, 40960, 16, 128, 128, 8, 4)
     assert programs["fused"].metadata.launch_pdl and programs["fused_reduce"].metadata.launch_pdl
+    prefill, _ = _plan(128, 5120, 40960, 64, 64, 128, 4, 4)  # prefill-size launches stay plain
+    assert not prefill["fused"].metadata.launch_pdl and not prefill["fused_reduce"].metadata.launch_pdl
 
 
 @pytest.mark.parametrize("rows,n,k,tile_m,tile_n,tile_k,split,warps", CASES)

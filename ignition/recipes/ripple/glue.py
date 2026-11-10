@@ -35,9 +35,16 @@ from torch._inductor.runtime.triton_helpers import libdevice
 _BLOCK = 1024
 
 
-def _pdl(tensor):
-    """Programmatic launches (and their pre-wait L2 warming) need SM90+."""
-    return torch.cuda.get_device_capability(tensor.device)[0] >= 9
+_PDL_MAX_ROWS = 64
+
+
+def _pdl(tensor, rows):
+    """Programmatic launches (and their pre-wait L2 warming) need SM90+ and a decode-size launch.
+
+    Above 64 rows (4 requests x 16 verification rows) a launch is a prefill launch. With PDL, prefill
+    measured 1.2 to 1.8% slower (2026-11-10), so those launches stay plain.
+    """
+    return rows <= _PDL_MAX_ROWS and torch.cuda.get_device_capability(tensor.device)[0] >= 9
 
 
 @triton.jit
@@ -152,7 +159,7 @@ def _residual_norm_rows(delta: torch.Tensor | None, hidden: torch.Tensor, post_w
     updated = hidden if delta is None else out[0]
     normed = out[0 if delta is None else 1]
     lerped = normed if start is None else out[-1]
-    pdl = _pdl(hidden)
+    pdl = _pdl(hidden, rows)
     _residual_norm[(rows,)](
         hidden if delta is None else delta, hidden, weight if post_weight is None else post_weight, weight,
         hidden if start is None else start, weight if blend is None else blend, updated, normed, lerped,
@@ -233,7 +240,7 @@ def _qk_rope_rows(qgk: torch.Tensor, v: torch.Tensor, q_norm: torch.Tensor, k_no
     tokens, heads, dim = q.shape
     kv_heads = key.shape[1]
     rope = cos is not None
-    pdl = _pdl(qgk)
+    pdl = _pdl(qgk, tokens)
     _qk_rope[(tokens, heads + kv_heads)](
         qgk, v, q_norm, k_norm, cos if rope else q_norm, sin if rope else q_norm, q, key, value,
         eps, 1.0 / dim, qgk.stride(0), heads, kv_heads, dim, 2 * heads * dim, rope, PDL=pdl,
@@ -264,7 +271,7 @@ def gate(attended: torch.Tensor, qgk: torch.Tensor, offset: int) -> torch.Tensor
     tokens, width = attended.shape
     out = attended.new_empty((tokens, width))
     block = 1024
-    pdl = _pdl(attended)
+    pdl = _pdl(attended, tokens)
     _gate[(tokens, triton.cdiv(width, block))](
         attended, qgk, out, attended.stride(0), qgk.stride(0), offset, width, block, PDL=pdl, num_warps=4,
         enable_fp_fusion=False, launch_pdl=pdl)
