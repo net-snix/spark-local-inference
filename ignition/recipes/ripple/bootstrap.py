@@ -260,7 +260,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group, ipc=ipc,
                                      runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
-    prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
+    prefill_sizes = prefill_capacities(config.prefill_chunk_size, midpoints=True)
+    batch_sizes = batch_capacities(config.max_active)
     modes = (True, False) if config.mtp else (False,)
     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes))
              + len(batch_sizes) + len(config.speculative_round_shapes))
