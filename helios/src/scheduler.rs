@@ -90,6 +90,26 @@ pub fn prefill_capacities(chunk_size: usize) -> impl Iterator<Item = usize> {
         .chain(std::iter::once(chunk_size))
 }
 
+/// Drop message boundaries closer than `spacing` tokens to the reuse point, the previously retained
+/// boundary, or the prompt end. A prefill launch that stops at a boundary costs one full weight pass,
+/// so a checkpoint that can save fewer prompt tokens than that pass costs is a net loss for agent
+/// turns, where only the prompt end and the terminal state are reused. Zero keeps every boundary.
+fn spaced_boundaries(mut boundaries: Vec<usize>, consumed: usize, prompt: usize, spacing: usize) -> Vec<usize> {
+    if spacing == 0 {
+        return boundaries;
+    }
+    let mut previous = consumed;
+    boundaries.retain(|&position| {
+        let keep = position >= previous.saturating_add(spacing)
+            && position.saturating_add(spacing) <= prompt;
+        if keep {
+            previous = position;
+        }
+        keep
+    });
+    boundaries
+}
+
 fn checkpoint_boundaries(
     mut boundaries: Vec<usize>,
     consumed: usize,
@@ -1607,7 +1627,8 @@ impl RequestScheduler {
         };
         let endpoints = 1 + usize::from(spec.max_new_tokens > 1 && consumed < spec.prompt.len() as u64);
         let message_boundaries = checkpoint_boundaries(
-            spec.message_boundaries,
+            spaced_boundaries(spec.message_boundaries, consumed as usize, spec.prompt.len(),
+                self.policy.prefix_checkpoint_spacing),
             consumed as usize,
             spec.prompt.len(),
             checkpoint_budget.saturating_sub(endpoints),

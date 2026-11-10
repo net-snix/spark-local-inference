@@ -333,6 +333,11 @@ impl Bootstrap {
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .ok_or("adaptive verification alpha must be finite and greater than zero")?;
         }
+        if let Some(value) = object.get("prefix_checkpoint_spacing") {
+            scheduling_policy.prefix_checkpoint_spacing = value.as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or("prefix_checkpoint_spacing must be a nonnegative integer")?;
+        }
         let server = ServerConfig {
             scheduling_policy,
             thinking_token_budget: object.get("thinking_token_budget")

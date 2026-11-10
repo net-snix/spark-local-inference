@@ -924,6 +924,11 @@ pub struct ServingOptions {
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,
 
+    /// Minimum prompt tokens between prefix checkpoints inside one request; closer message boundaries
+    /// are prefilled through instead of ending a launch there [default: 0, every boundary].
+    #[arg(long, value_name = "TOKENS", help_heading = "Prefix cache options")]
+    pub prefix_checkpoint_spacing: Option<usize>,
+
     /// Warm host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables warm retention.
     /// Automatic intake is additional when memory or disk is enabled [default: prefix_cache.memory, else 0].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
@@ -1088,6 +1093,9 @@ impl ServingOptions {
         }
         // Every rank keeps its own records under its host's directory; rank zero's store drives
         // all of them, so every rank needs the same settings.
+        if let Some(tokens) = self.prefix_checkpoint_spacing {
+            options.extend(["--prefix-checkpoint-spacing".into(), tokens.to_string()]);
+        }
         if let Some(bytes) = self.prefix_cache_memory {
             options.extend(["--prefix-cache-memory".into(), bytes.to_string()]);
         }

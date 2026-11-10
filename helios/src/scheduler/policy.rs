@@ -22,6 +22,8 @@ pub struct PolicyConfig {
     pub adaptation_ms: f64,
     pub estimate_ttl_ns: u64,
     pub adaptive_verification_alpha: f64,
+    /// Minimum prompt tokens between prefix checkpoints inside one request; 0 keeps every boundary.
+    pub prefix_checkpoint_spacing: usize,
 }
 
 impl Default for PolicyConfig {
@@ -36,6 +38,7 @@ impl Default for PolicyConfig {
             adaptation_ms: 100.0,
             estimate_ttl_ns: 30_000_000_000,
             adaptive_verification_alpha: 1.0,
+            prefix_checkpoint_spacing: 0,
         }
     }
 }
