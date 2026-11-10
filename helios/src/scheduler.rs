@@ -1606,11 +1606,16 @@ impl RequestScheduler {
             (self.limits.snapshots as usize / self.limits.max_active).clamp(1, 8)
         };
         let endpoints = 1 + usize::from(spec.max_new_tokens > 1 && consumed < spec.prompt.len() as u64);
+        // A message checkpoint ends its prefill chunk early, and every chunk is one more pass over the weights.
+        // When the rest of the prompt fits one chunk (an agent turn appending a tool result), only the prompt-end
+        // snapshot, which the next turn of the conversation restores, is worth that pass.
+        let single_chunk = spec.prompt.len().saturating_sub(consumed as usize)
+            <= self.prefill_catalog.last().copied().unwrap_or(0);
         let message_boundaries = checkpoint_boundaries(
             spec.message_boundaries,
             consumed as usize,
             spec.prompt.len(),
-            checkpoint_budget.saturating_sub(endpoints),
+            if single_chunk { 0 } else { checkpoint_budget.saturating_sub(endpoints) },
         );
         self.slots[slot].generation = generation;
         self.slots[slot].request = Some(LiveRequest {
