@@ -6,11 +6,12 @@
 from dataclasses import dataclass, field
 
 import torch
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, rotate_half
+from transformers.models.qwen3.modeling_qwen3 import rotate_half
 
 from ignition.components.candidate_selector import PreparedCandidateSelector
 from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllGather
 from ignition.components.dflash2_full_attention import SPLITS, PreparedDraftFullAttention
+from ignition.components.draft_norm import DraftRMSNorm
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.grouped_convolution import PreparedGroupedConvolution
 from ignition.components.linear import prepare_projection
@@ -23,10 +24,7 @@ PAGE_TOKENS = 128
 
 
 def _norm(weight, eps):
-    with torch.device("meta"):
-        module = Qwen3RMSNorm(weight.numel(), eps=eps)
-    module.weight = torch.nn.Parameter(weight, requires_grad=False)
-    return module.eval()
+    return DraftRMSNorm(weight, eps)
 
 
 def _inverse(geometry, device):
@@ -311,7 +309,7 @@ class DraftAttention:
 class PreparedDraft:
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime, embedding_runtime,
                  coordinator, session, name, workspace, buffers, embedding, head,
-                 output_multiplier, final_logit_softcapping):
+                 output_multiplier, final_logit_softcapping, exact_head=None):
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
         c, s = weights.config.draft, scratch
         _, group = c.convolution
@@ -348,6 +346,16 @@ class PreparedDraft:
         self.selector = s.selectors[selector_key]
         self.multiplier = output_multiplier
         self.softcap = final_logit_softcapping
+        self.exact_head = exact_head
+        if exact_head is not None:
+            from ignition.components.draft_head import RESCORE_CANDIDATES, check
+
+            if weights.shard.world_size != 1 or exact_head.shape[0] < s.logits.shape[1]:
+                raise ValueError("draft head rescoring requires one rank holding the whole vocabulary")
+            rows = s.hidden.shape[0]
+            self.rescore_ids = torch.zeros((rows, RESCORE_CANDIDATES), dtype=torch.int64, device=s.hidden.device)
+            self.rescored = torch.zeros((rows, RESCORE_CANDIDATES), dtype=torch.bfloat16, device=s.hidden.device)
+            check(s.hidden, exact_head, self.rescore_ids, self.rescored)
 
     def __call__(self):
         s, c = self.scratch, self.weights.config.draft
@@ -359,9 +367,21 @@ class PreparedDraft:
             s.embedding.add_(mlp_conv.finish(reduce(mlp(mlp_conv.prepare(s.normalized)))))
         s.hidden.copy_(self.norm(s.embedding[self.metadata.sample_indices]))
         self.head(s.hidden)
-        # The unary transform consumes the head result in FP32.
-        unary = s.gathered_logits[:, :c.text["vocab_size"]].float() * self.multiplier
-        s.logits.copy_(unary if self.softcap is None else (unary / self.softcap).tanh() * self.softcap)
+        if self.exact_head is not None:
+            from ignition.components.draft_head import RESCORE_CANDIDATES, rescore
+
+            # The approximate head only ranks; shortlisted candidates get exact BF16 head logits.
+            approximate = s.gathered_logits[:, :c.text["vocab_size"]]
+            self.rescore_ids.copy_(approximate.topk(RESCORE_CANDIDATES, dim=-1, sorted=False).indices)
+            rescore(s.hidden, self.exact_head, self.rescore_ids, self.rescored)
+            unary = self.rescored.float() * self.multiplier
+            s.logits.fill_(-torch.inf)
+            s.logits.scatter_(1, self.rescore_ids,
+                              unary if self.softcap is None else (unary / self.softcap).tanh() * self.softcap)
+        else:
+            # The unary transform consumes the head result in FP32.
+            unary = s.gathered_logits[:, :c.text["vocab_size"]].float() * self.multiplier
+            s.logits.copy_(unary if self.softcap is None else (unary / self.softcap).tanh() * self.softcap)
         self.selector.prepare(s.hidden.view(-1, s.block_size, s.hidden.shape[-1]))
 
     def scratch_tensors(self):

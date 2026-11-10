@@ -399,7 +399,8 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
             close_resources.append(resource)
     return PreparedModel(
         rebuild_weights=declare_weights(weights, components=("embedding", "norm", "head",
-            *(("draft", "draft_embedding") if weights.draft is not None else ()))),
+            *(("draft", "draft_embedding") if weights.draft is not None else ()),
+            *(("draft_head",) if weights.draft_head is not None else ()))),
         device=device_id, graphs=graphs, buffers=buffers, signatures=signatures, max_active=config.max_active,
         session=session, server_config=server_config, memory_report=memory, close_resources=tuple(close_resources),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),

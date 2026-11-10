@@ -29,7 +29,9 @@ class SpeculativePreparation(DFlash2Preparation):
                 vocabulary_runtime=vocabulary_runtime, buffers=decoder_buffers.cursor())
 
         super().__init__(weights, pool, requests, inputs, scratch, decoder=decoder,
-            embedding=weights.draft_embedding, head=weights.head, page_tokens=PAGE_TOKENS,
+            embedding=weights.draft_embedding,
+            head=weights.head if weights.draft_head is None else weights.draft_head,
+            exact_head=None if weights.draft_head is None else weights.head, page_tokens=PAGE_TOKENS,
             completion=completion, frame=frame, sequence=sequence, session=session, workspace=workspace,
             buffers=buffers, context_buffers=context_buffers, verification_width=verification_width,
             runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,

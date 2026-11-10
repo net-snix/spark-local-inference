@@ -37,6 +37,8 @@ class ModelWeights:
     shard: TensorParallelShard = TensorParallelShard(0, 1)
     draft: object = None
     draft_embedding: torch.Tensor | None = None
+    # MXFP8 copy of the head that only ranks drafter candidates; the target head stays BF16.
+    draft_head: object = None
 
     @classmethod
     def load(cls, manifest, device, *, shard: TensorParallelShard = TensorParallelShard(0, 1), progress=None,
@@ -73,9 +75,14 @@ class ModelWeights:
             # own column shard instead of a rank-dependent view into the replicated table.
             first, last = shard.partition(config.hidden, alignment=64)
             draft_embedding = embedding[:, first:last].contiguous()
+        draft_head = None
+        if draft is not None and online_mxfp8 and shard.world_size == 1:
+            from ignition.components.vocabulary import mxfp8_draft_head
+
+            draft_head = mxfp8_draft_head(head)
         return cls(config=config, embedding=embedding, norm=norm, head=head, layers=layers,
                    allocated_bytes=torch.cuda.memory_allocated(device) - before, shard=shard, draft=draft,
-                   draft_embedding=draft_embedding)
+                   draft_embedding=draft_embedding, draft_head=draft_head)
 
 
 class RippleWeightLoader(DirectWeightLoader):

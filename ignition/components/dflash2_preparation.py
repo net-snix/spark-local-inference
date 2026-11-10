@@ -16,7 +16,8 @@ class DFlash2Preparation:
     def __init__(self, weights, pool, requests, inputs, scratch, *, decoder, embedding, head,
                  page_tokens, completion, frame, sequence, session, workspace, buffers,
                  context_buffers, verification_width=8, study_width=None, runtime=None,
-                 vocabulary_runtime=None, coordinator=None, block_size=None, gather_runtime=None):
+                 vocabulary_runtime=None, coordinator=None, block_size=None, gather_runtime=None,
+                 exact_head=None):
         width = verification_width if study_width is None else study_width
         if type(width) is not int or not 1 <= width <= 16:
             raise ValueError("DFlash2 verification capacity must be an integer in [1,16]")
@@ -32,7 +33,7 @@ class DFlash2Preparation:
         self.forwards = SimpleNamespace(decoder=decoder,
             context=partial(PreparedContext, runtime=gather_runtime, coordinator=coordinator,
                 buffers=context_buffers.cursor()),
-            draft=partial(PreparedDraft, embedding=embedding, head=head,
+            draft=partial(PreparedDraft, embedding=embedding, head=head, exact_head=exact_head,
                 output_multiplier=1., final_logit_softcapping=None,
                 embedding_runtime=gather_runtime, buffers=buffers), markov=None)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
