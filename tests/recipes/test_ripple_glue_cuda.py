@@ -109,6 +109,39 @@ def test_qk_rope_close_to_staged(tokens, rope):
     assert torch.equal(q1, q[:1]) and torch.equal(k1, key[:1])
 
 
+@pytest.mark.parametrize("tokens", (1, 16, 64, 2048))
+@pytest.mark.parametrize("rope", (False, True))
+def test_qk_rope_cache_matches_writer(tokens, rope):
+    """Cache mode stores exactly what the buffers plus the paged KV writer store; negative slots write nothing."""
+    from b12x.attention import paged_kv_write
+    from ignition.recipes.ripple.glue import qk_rope
+
+    generator = torch.Generator(device="cuda").manual_seed(100 + tokens + rope)
+    qgk = _rows(tokens, (2 * HEADS + KV_HEADS) * DIM, 3.0, generator)
+    v = _rows(tokens, KV_HEADS * DIM, 1.0, generator)
+    q_norm, k_norm = _gain(DIM, generator), _gain(DIM, generator)
+    table = torch.rand(tokens, DIM, device="cuda", generator=generator) * 6
+    cos, sin = table.cos().bfloat16().float(), table.sin().bfloat16().float()
+    page, pages = 128, (tokens + 127) // 128 + 3
+    slots = torch.randperm(pages * page, device="cuda", generator=generator)[:tokens].long()
+    slots[torch.rand(tokens, device="cuda", generator=generator) < 0.2] = -1
+    q = torch.empty(tokens, HEADS, DIM, device="cuda", dtype=torch.bfloat16)
+    key = torch.empty(tokens, KV_HEADS, DIM, device="cuda", dtype=torch.bfloat16)
+    value = torch.empty_like(key)
+    fill = _rows(pages * page * KV_HEADS, DIM, 1.0, generator).view(pages, page, KV_HEADS, DIM)
+    want_k, want_v, got_k, got_v = (fill.clone() for _ in range(4))
+    qk_rope(qgk, v, q_norm, k_norm, cos, sin, q, key, value, EPS, rope=rope)
+    plan = paged_kv_write.plan(paged_kv_write.Caps(device=key.device, num_kv_heads=KV_HEADS, head_dim_k=DIM,
+                                                   head_dim_v=DIM, page_size=page, kv_dtype=torch.bfloat16))
+    paged_kv_write.run(plan, key=key, value=value, k_cache=want_k, v_cache=want_v, slot_mapping=slots,
+                       k_scale=None, v_scale=None)
+    q2 = torch.empty_like(q)
+    qk_rope(qgk, v, q_norm, k_norm, cos, sin, q2, key, value, EPS, rope=rope, cache=(got_k, got_v, slots))
+    assert torch.equal(q2.view(torch.int16), q.view(torch.int16))
+    assert torch.equal(got_k.view(torch.int16), want_k.view(torch.int16))
+    assert torch.equal(got_v.view(torch.int16), want_v.view(torch.int16))
+
+
 @pytest.mark.parametrize("tokens", (1, 16, 2048))
 def test_gate_matches_staged(tokens):
     from ignition.recipes.ripple.glue import gate

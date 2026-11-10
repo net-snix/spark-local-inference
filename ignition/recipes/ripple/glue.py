@@ -12,7 +12,8 @@ on how many rows the launch has. They are not bit-identical to ATen's mean (accu
 numerics class B), but a row's result is the same at C1, C4 and in prefill.
 
 - `residual_norm`: optional `hidden + norm(delta, post)`, then `norm(., weight)` and the value lerp.
-- `qk_rope`: q/k RMSNorm per head, RoPE on sliding layers, and the q, key and value buffer writes.
+- `qk_rope`: q/k RMSNorm per head, RoPE on sliding layers, the q write, and key/value into their
+  buffers or straight into their cache slots (2026-11-10, replaces the paged KV writer launch).
 - `gate`: `attended * bf16(sigmoid(fp32(gate_logits)))`.
 
 On SM90+ every kernel launches programmatically (PDL, 2026-11-09): it may start while the previous kernel
@@ -172,9 +173,10 @@ def _fake_residual_norm_rows(delta, hidden, post_weight, weight, start, blend, e
 
 
 @triton.jit
-def _qk_rope(QGK, V, QNorm, KNorm, Cos, Sin, Q, Key, Value, eps, factor, qgk_stride,
+def _qk_rope(QGK, V, QNorm, KNorm, Cos, Sin, Q, Key, Value, Slots, eps, factor, qgk_stride,
+             key_page_stride, key_token_stride, value_page_stride, value_token_stride, capacity,
              HEADS: tl.constexpr, KV_HEADS: tl.constexpr, DIM: tl.constexpr, K_OFFSET: tl.constexpr,
-             ROPE: tl.constexpr, PDL: tl.constexpr = False):
+             ROPE: tl.constexpr, CACHE: tl.constexpr = False, PAGE: tl.constexpr = 1, PDL: tl.constexpr = False):
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     HALF: tl.constexpr = DIM // 2
@@ -192,15 +194,26 @@ def _qk_rope(QGK, V, QNorm, KNorm, Cos, Sin, Q, Key, Value, eps, factor, qgk_str
         source = QGK + token * qgk_stride + head * DIM
         gain = QNorm
         target = Q + (token * HEADS + head) * DIM
+        keep = token >= 0
     else:
         kv = head - HEADS
         source = QGK + token * qgk_stride + K_OFFSET + kv * DIM
         gain = KNorm
-        target = Key + (token * KV_HEADS + kv) * DIM
         value = V + (token * KV_HEADS + kv) * DIM
-        out = Value + (token * KV_HEADS + kv) * DIM
-        tl.store(out + half, tl.load(value + half))
-        tl.store(out + HALF + half, tl.load(value + HALF + half))
+        if CACHE:
+            # Cache mode: key and value go straight to their page slot (a negative or out-of-capacity slot writes nothing).
+            slot = tl.load(Slots + token)
+            keep = (slot >= 0) & (slot < capacity)
+            page = slot // PAGE
+            offset = slot - page * PAGE
+            target = Key + page * key_page_stride + offset * key_token_stride + kv * DIM
+            out = Value + page * value_page_stride + offset * value_token_stride + kv * DIM
+        else:
+            keep = token >= 0
+            target = Key + (token * KV_HEADS + kv) * DIM
+            out = Value + (token * KV_HEADS + kv) * DIM
+        tl.store(out + half, tl.load(value + half), keep)
+        tl.store(out + HALF + half, tl.load(value + HALF + half), keep)
     left = tl.load(source + half).to(tl.float32)
     right = tl.load(source + HALF + half).to(tl.float32)
     total = tl.sum(left * left, axis=0) + tl.sum(right * right, axis=0)
@@ -214,20 +227,51 @@ def _qk_rope(QGK, V, QNorm, KNorm, Cos, Sin, Q, Key, Value, eps, factor, qgk_str
         table = token * DIM
         left = (lf * tl.load(Cos + table + half) + (-rf) * tl.load(Sin + table + half)).to(tl.bfloat16)
         right = (rf * tl.load(Cos + table + HALF + half) + lf * tl.load(Sin + table + HALF + half)).to(tl.bfloat16)
-    tl.store(target + half, left)
-    tl.store(target + HALF + half, right)
+    tl.store(target + half, left, keep)
+    tl.store(target + HALF + half, right, keep)
 
 
-def qk_rope(qgk, v, q_norm, k_norm, cos, sin, q, key, value, eps, *, rope):
-    """Writes q = rope(norm(q)), key = rope(norm(k)) (no RoPE when `rope` is False) and value = v."""
+def qk_rope(qgk, v, q_norm, k_norm, cos, sin, q, key, value, eps, *, rope, cache=None):
+    """Writes q = rope(norm(q)), key = rope(norm(k)) (no RoPE when `rope` is False) and value = v.
+
+    With `cache=(key_cache, value_cache, slots)` key and value go straight to cache slot `slots[t]` of
+    `[pages, page_tokens, kv_heads, dim]` caches (what the paged KV writer stores, bit for bit), and the
+    `key`/`value` buffers are left alone."""
     tokens, heads, dim = q.shape
     kv_heads = key.shape[1]
     if qgk.stride(-1) != 1 or v.stride(-1) != 1 or v.stride(0) != kv_heads * dim:
         raise ValueError("q/k RoPE reads row-contiguous qgk and v")
     if rope and (cos.dtype != torch.float32 or cos.stride(0) != dim or sin.stride(0) != dim):
         raise ValueError("RoPE tables are contiguous FP32 rows of the head dimension")
-    _qk_rope_rows(qgk, v, q_norm, k_norm, cos if rope else None, sin if rope else None, q, key, value,
-                  float(eps))
+    if cache is None:
+        _qk_rope_rows(qgk, v, q_norm, k_norm, cos if rope else None, sin if rope else None, q, key, value,
+                      float(eps))
+        return
+    key_cache, value_cache, slots = cache
+    for c in (key_cache, value_cache):
+        if (c.dtype != q.dtype or c.dim() != 4 or c.shape[2:] != (kv_heads, dim) or c.stride(-1) != 1
+                or c.stride(-2) != dim or c.shape[1] != key_cache.shape[1]):
+            raise ValueError("q/k RoPE writes [pages, page_tokens, kv_heads, dim] caches of the query dtype")
+    if slots.dtype != torch.int64 or slots.shape != (tokens,):
+        raise ValueError("cache slots are one int64 per token")
+    _qk_rope_cache_rows(qgk, v, q_norm, k_norm, cos if rope else None, sin if rope else None, q, key_cache,
+                        value_cache, slots, float(eps))
+
+
+def _launch_qk_rope(qgk, v, q_norm, k_norm, cos, sin, q, key, value, slots, eps):
+    tokens, heads, dim = q.shape
+    kv_heads = key.shape[-2]
+    rope = cos is not None
+    cache = slots is not None
+    pdl = _pdl(qgk)
+    _qk_rope[(tokens, heads + kv_heads)](
+        qgk, v, q_norm, k_norm, cos if rope else q_norm, sin if rope else q_norm, q, key, value,
+        slots if cache else qgk, eps, 1.0 / dim, qgk.stride(0),
+        key.stride(0) if cache else 0, key.stride(1) if cache else 0,
+        value.stride(0) if cache else 0, value.stride(1) if cache else 0,
+        min(key.shape[0], value.shape[0]) * key.shape[1] if cache else 0,
+        heads, kv_heads, dim, 2 * heads * dim, rope, cache, key.shape[1] if cache else 1, PDL=pdl,
+        num_warps=1, enable_fp_fusion=False, launch_pdl=pdl)
 
 
 @torch.library.custom_op("flare::ripple_qk_rope", mutates_args=("q", "key", "value"))
@@ -235,14 +279,21 @@ def _qk_rope_rows(qgk: torch.Tensor, v: torch.Tensor, q_norm: torch.Tensor, k_no
                   cos: torch.Tensor | None, sin: torch.Tensor | None, q: torch.Tensor, key: torch.Tensor,
                   value: torch.Tensor, eps: float) -> None:
     """The q/k RoPE launch (RoPE when the tables are given)."""
-    tokens, heads, dim = q.shape
-    kv_heads = key.shape[1]
-    rope = cos is not None
-    pdl = _pdl(qgk)
-    _qk_rope[(tokens, heads + kv_heads)](
-        qgk, v, q_norm, k_norm, cos if rope else q_norm, sin if rope else q_norm, q, key, value,
-        eps, 1.0 / dim, qgk.stride(0), heads, kv_heads, dim, 2 * heads * dim, rope, PDL=pdl,
-        num_warps=1, enable_fp_fusion=False, launch_pdl=pdl)
+    _launch_qk_rope(qgk, v, q_norm, k_norm, cos, sin, q, key, value, None, eps)
+
+
+@torch.library.custom_op("flare::ripple_qk_rope_cache", mutates_args=("q", "key_cache", "value_cache"))
+def _qk_rope_cache_rows(qgk: torch.Tensor, v: torch.Tensor, q_norm: torch.Tensor, k_norm: torch.Tensor,
+                        cos: torch.Tensor | None, sin: torch.Tensor | None, q: torch.Tensor,
+                        key_cache: torch.Tensor, value_cache: torch.Tensor, slots: torch.Tensor,
+                        eps: float) -> None:
+    """The q/k RoPE launch that also stores key and value in their cache slots."""
+    _launch_qk_rope(qgk, v, q_norm, k_norm, cos, sin, q, key_cache, value_cache, slots, eps)
+
+
+@_qk_rope_cache_rows.register_fake
+def _fake_qk_rope_cache_rows(qgk, v, q_norm, k_norm, cos, sin, q, key_cache, value_cache, slots, eps):
+    pass
 
 
 @_qk_rope_rows.register_fake

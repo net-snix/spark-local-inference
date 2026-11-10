@@ -149,6 +149,7 @@ class PreparedLayer:
         else:
             w = self.window
             key_cache, value_cache, pages, slots, tuning_pages = w.key, w.value, w.pages, w.slots, w.tuning_page_count
+        self.cache = (key_cache, value_cache, slots)
         self.writer = PreparedPagedKVWriter(self.key, self.value, key_cache, value_cache, slots,
                                             session=session, name=f"{name}.cache_write")
         self.attention = PreparedPagedAttention(self.q, key_cache, value_cache, pages,
@@ -162,9 +163,13 @@ class PreparedLayer:
         w, eps, tokens = self.weights, self.eps, hidden.shape[0]
         self.qgk(normed)
         self.v_proj(value_input)
+        # A prefill chunk's window gather copies whole ring pages into staging, the chunk's first page
+        # too: it must land before this chunk's keys and values are written over it.
+        if self.window is not None:
+            self.window.gather()
         if hidden.is_cuda:
             glue.qk_rope(self.qgk_out, self.v_out, w["q_norm"], w["k_norm"], cos, sin, self.q, self.key,
-                         self.value, eps, rope=self.is_sliding)
+                         self.value, eps, rope=self.is_sliding, cache=self.cache)
         else:
             q = rms_norm(self.qgk_out[:, :self.q_width].view(tokens, self.heads, self.dim), w["q_norm"], eps)
             k = rms_norm(self.qgk_out[:, 2 * self.q_width:].view(tokens, self.kv_heads, self.dim), w["k_norm"], eps)
@@ -173,9 +178,7 @@ class PreparedLayer:
             self.q.copy_(q)
             self.key.copy_(k)
             self.value.copy_(self.v_out.view(tokens, self.kv_heads, self.dim))
-        if self.window is not None:
-            self.window.gather()
-        self.writer()
+            self.writer()
         self.attention()
         if self.window is not None:
             self.window.commit()
