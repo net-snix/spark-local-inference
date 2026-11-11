@@ -110,6 +110,23 @@ impl ValueRate {
         }
     }
 
+    /// Rate of a measured launch that starts a longer sequence: the value and the duration of the
+    /// whole sequence. Only the launch itself delays other lanes, because the plan is chosen again
+    /// after it.
+    pub fn sequence(
+        duration_ns: u64,
+        sequence_ns: u64,
+        sequence_value: f64,
+        decode_age_price: f64,
+    ) -> Self {
+        debug_assert!(duration_ns != 0 && sequence_ns >= duration_ns);
+        Self {
+            duration_ns,
+            score: sequence_value / (sequence_ns as f64 / 1e6)
+                - decode_age_price * (duration_ns as f64 / 1e6) / 2.0,
+        }
+    }
+
     pub fn compare(self, other: Self) -> std::cmp::Ordering {
         (self.duration_ns == 0)
             .cmp(&(other.duration_ns == 0))
@@ -314,6 +331,15 @@ mod tests {
         let small = ValueRate::new(3_000_000, value.prefill(64, true), 0.0);
         let padded = ValueRate::new(66_000_000, value.prefill(64, true), 0.0);
         assert!(small.compare(padded).is_gt());
+    }
+
+    #[test]
+    fn sequence_rate_spreads_the_value_over_the_whole_sequence() {
+        let alone = ValueRate::new(4_000_000, 96.0, 0.5);
+        let same = ValueRate::sequence(4_000_000, 4_000_000, 96.0, 0.5);
+        assert_eq!((alone.duration_ns, alone.score), (same.duration_ns, same.score));
+        let first = ValueRate::sequence(4_000_000, 12_000_000, 96.0, 0.5);
+        assert_eq!((first.duration_ns, first.score), (4_000_000, 96.0 / 12.0 - 0.5 * 4.0 / 2.0));
     }
 
     #[test]

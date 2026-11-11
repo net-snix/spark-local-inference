@@ -342,6 +342,69 @@ impl RequestScheduler {
         end.saturating_sub(start)
     }
 
+    /// Least total duration of measured prefill graphs that consume `tokens` more tokens of one
+    /// request. None when no graph of this kind is measured.
+    fn prefill_cover_ns(&self, kind: GraphKind, tokens: usize) -> Option<u64> {
+        // Every prefill capacity is a multiple of this many tokens.
+        const UNIT: usize = 64;
+        let shapes: Vec<(usize, u64)> = self
+            .prefill_catalog(kind)
+            .iter()
+            .filter_map(|&capacity| {
+                let ns = self.costs.duration(kind, 1, capacity)?;
+                (ns != 0).then_some((capacity / UNIT, ns))
+            })
+            .collect();
+        // The graph with the least time per token carries the bulk of a long remainder. The exact
+        // search covers the last tokens, where padding decides.
+        let &(bulk, bulk_ns) = shapes
+            .iter()
+            .min_by(|a, b| (a.1 as u128 * b.0 as u128).cmp(&(b.1 as u128 * a.0 as u128)))?;
+        let largest = shapes.iter().map(|&(size, _)| size).max()?;
+        let units = tokens.div_ceil(UNIT);
+        let repeats = units.saturating_sub(2 * largest) / bulk;
+        let tail = units - repeats * bulk;
+        let mut best = vec![0u64; tail + 1];
+        for covered in 1..=tail {
+            best[covered] = shapes
+                .iter()
+                .map(|&(size, ns)| ns.saturating_add(best[covered.saturating_sub(size)]))
+                .min()?;
+        }
+        Some(best[tail].saturating_add(bulk_ns.saturating_mul(repeats as u64)))
+    }
+
+    /// Rate of the cheapest sequence of prefill launches that starts with `capacity` and reaches
+    /// the end of the request's current prefill segment. None when the launch ends the segment,
+    /// starts a cheapest sequence for the segment, or the sequence is unknown.
+    fn prefill_sequence_rate(
+        &self,
+        r: &LiveRequest,
+        kind: GraphKind,
+        capacity: usize,
+        duration_ns: u64,
+        value: LaneValue,
+        age_price: f64,
+    ) -> Option<ValueRate> {
+        if duration_ns == 0 || !r.prefill_spans.is_empty() {
+            return None;
+        }
+        let work = self.prefill_work(r, capacity);
+        let segment = self.prefill_work(r, usize::MAX);
+        if work >= segment {
+            return None;
+        }
+        let sequence_ns = duration_ns.saturating_add(self.prefill_cover_ns(kind, segment - work)?);
+        if sequence_ns <= self.prefill_cover_ns(kind, segment)? {
+            return None;
+        }
+        let total = value.prefill(
+            segment,
+            r.consumed_tokens + segment as u64 == r.prompt_tokens as u64,
+        );
+        Some(ValueRate::sequence(duration_ns, sequence_ns, total, age_price))
+    }
+
     pub fn submission_window_available(&self, duration_ns: u64) -> bool {
         self.submissions.len() < 2
             && !self.submissions.values().any(|s| s.requires_feedback)
@@ -905,6 +968,18 @@ impl RequestScheduler {
                 age_price,
             )
             .unwrap_or_else(|| (selected, ValueRate::new(duration_ns, expected, age_price)));
+        // A prefill launch off the cheapest sequence is worth no more than the sequence it starts.
+        // A graph filled to capacity has the best rate of its own, but it does not pay when the
+        // tokens it leaves need one more padded launch.
+        let rate = if kind.is_prefill() && selected.count_ones() == 1 {
+            let slot = selected.trailing_zeros() as usize;
+            let r = self.slots[slot].request.as_ref().unwrap();
+            self.prefill_sequence_rate(r, kind, capacity, duration_ns, values[slot], age_price)
+                .filter(|sequence| sequence.score < rate.score)
+                .unwrap_or(rate)
+        } else {
+            rate
+        };
         output.push(Candidate { host_lengths: None, draft_tokens: drafts, packed_token_capacity: packed,
             kind,
             mask: selected,

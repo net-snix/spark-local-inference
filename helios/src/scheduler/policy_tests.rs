@@ -3918,3 +3918,72 @@ fn fixed_host_prefixes_preserve_lengths_above_255() {
     assert_eq!(plan.lanes[0].tokens, 257);
     assert_eq!(plan.token_capacity, 257);
 }
+
+/// Prefill launches (capacity, consumed tokens) of one request on a lone lane with these measured
+/// launch times in milliseconds.
+fn prefill_launches(
+    costs_ms: &[(usize, u64)],
+    prompt: usize,
+    boundaries: &[usize],
+) -> Vec<(usize, usize)> {
+    let mut s = engine(1, false);
+    let capacities: Vec<_> = costs_ms.iter().map(|(capacity, _)| *capacity).collect();
+    s.prefill_graphs(&capacities).unwrap();
+    s.configure_policy(PolicyConfig {
+        output_token_value: 8.0,
+        token_fairness: 0.0,
+        delivery_fairness: 0.0,
+        decode_age_price: 0.0,
+        ..s.policy
+    })
+    .unwrap();
+    for &(capacity, ms) in costs_ms {
+        set_cost(&mut s, GraphKind::Prefill, 1, capacity, ms * MS);
+    }
+    let h = add(&mut s, 1, prompt, 16);
+    s.request_mut(h).unwrap().message_boundaries = boundaries.to_vec();
+    let mut launches = Vec::new();
+    while (s.request(h).unwrap().consumed_tokens as usize) < prompt {
+        let plan = step(&mut s, 0);
+        if plan.kind == GraphKind::Prefill {
+            launches.push((plan.token_capacity, plan.lanes[0].tokens));
+        }
+    }
+    launches
+}
+
+// Launch times with a fixed cost per launch, as measured on a served model.
+const FIXED_COST_PREFILL_MS: [(usize, u64); 3] = [(128, 68), (256, 126), (512, 250)];
+
+#[test]
+fn prefill_tail_takes_one_padded_graph_when_two_launches_cost_more() {
+    let costs = FIXED_COST_PREFILL_MS;
+    assert_eq!(prefill_launches(&costs, 100, &[]), [(128, 100)]);
+    // 128 + 128 costs 136 ms, one 256 launch 126 ms.
+    assert_eq!(prefill_launches(&costs, 161, &[]), [(256, 161)]);
+    // 256 + 128 + 128 costs 262 ms and 256 + 256 costs 252 ms, one 512 launch 250 ms.
+    assert_eq!(prefill_launches(&costs, 411, &[]), [(512, 411)]);
+}
+
+#[test]
+fn prefill_split_keeps_the_cheapest_sequence_and_its_most_efficient_launch_first() {
+    let costs = FIXED_COST_PREFILL_MS;
+    // 256 + 128 costs 194 ms, one 512 launch 250 ms.
+    assert_eq!(prefill_launches(&costs, 300, &[]), [(256, 256), (128, 44)]);
+    // 512 + 256 costs 376 ms, 512 + 128 + 128 costs 386 ms.
+    assert_eq!(prefill_launches(&costs, 700, &[]), [(512, 512), (256, 188)]);
+}
+
+#[test]
+fn prefill_sequence_is_planned_inside_each_message_segment() {
+    let costs = FIXED_COST_PREFILL_MS;
+    assert_eq!(prefill_launches(&costs, 300, &[161]), [(256, 161), (256, 139)]);
+}
+
+#[test]
+fn long_prefill_keeps_the_graph_with_the_least_time_per_token() {
+    let launches = prefill_launches(&FIXED_COST_PREFILL_MS, 4000, &[]);
+    assert_eq!(launches.len(), 8);
+    assert!(launches.iter().all(|(capacity, _)| *capacity == 512));
+    assert_eq!(launches.iter().map(|(_, tokens)| tokens).sum::<usize>(), 4000);
+}
