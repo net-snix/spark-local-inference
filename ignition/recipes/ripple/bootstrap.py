@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 from ignition.components.capacity import (
-    batch_capacities, parallel_speculative_shapes, prefill_capacities, request_capacity, speculative_token_capacity,
+    batch_capacities, fine_prefill_capacities, parallel_speculative_shapes, request_capacity, speculative_token_capacity,
 )
 from ignition.components.completion import CompletionOutputs, VECTOR_TOKENS_FIELD
 from ignition.components.dflash2 import PreparedContext
@@ -260,7 +260,7 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group, ipc=ipc,
                                      runtime=collective, coordinator=coordinator)
     forwards, signatures, metadata = {}, {}, {}
-    prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
+    prefill_sizes, batch_sizes = fine_prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     modes = (True, False) if config.mtp else (False,)
     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes))
              + len(batch_sizes) + len(config.speculative_round_shapes))

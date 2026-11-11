@@ -56,6 +56,23 @@ def prefill_capacities(chunk_size: int) -> tuple[int, ...]:
     return (*capacities, chunk_size)
 
 
+
+def fine_prefill_capacities(chunk_size: int) -> tuple[int, ...]:
+    """Prefill capacities in 128-token steps to 1024 and 256-token steps to 2048, then as above.
+
+    An agent turn appends a few hundred to a few thousand fresh tokens, so the doubling ladder pads
+    a 600-token turn to 1024 rows (Ripple-65B on a 300 W SM120: ~10% of prefill rows were padding).
+    Finer steps cost one more prepared graph each; Helios reads the catalog from the manifest.
+    """
+    if chunk_size <= 1024:
+        return prefill_capacities(chunk_size)
+    capacities = list(range(128, 1025, 128))
+    capacities += range(1280, min(chunk_size, 2048) + 1, 256)
+    capacities += (c for c in prefill_capacities(chunk_size) if c > capacities[-1])
+    if capacities[-1] != chunk_size:
+        capacities.append(chunk_size)
+    return tuple(capacities)
+
 def batch_capacities(concurrency: int) -> tuple[int, ...]:
     capacity = request_capacity(concurrency)
     return tuple(batch for batch in BATCH_CAPACITIES if batch <= capacity)
