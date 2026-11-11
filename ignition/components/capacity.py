@@ -37,12 +37,16 @@ def image_capacity(concurrency: int, capacity: int | None = None) -> int:
     return capacity
 
 
-def prefill_capacities(chunk_size: int) -> tuple[int, ...]:
+def prefill_capacities(chunk_size: int, *, fine: bool = False) -> tuple[int, ...]:
     """Token capacities offered to Helios for prompt chunk scheduling.
 
     Capacities double from 128 tokens to a step of at least 512 tokens and about an eighth of the
     chunk, then grow by that step, so a partial chunk pads by less than one step; the chunk size
     itself is last. Helios's `prefill_capacities` must agree.
+
+    `fine` adds 64-token steps up to 512 tokens and 128-token steps up to 1024. A short agent turn is
+    one launch that pays for its whole capacity, so the doubling ladder pads it by up to half.
+    Helios takes this catalog from the package's prefill graphs, so only the recipe opts in.
     """
     step = max(512, chunk_size // 8 // 512 * 512)
     capacities, capacity = [], 128
@@ -53,6 +57,9 @@ def prefill_capacities(chunk_size: int) -> tuple[int, ...]:
     while capacity < chunk_size:
         capacities.append(capacity)
         capacity += step
+    if fine:
+        steps = (*range(64, 512, 64), *range(512, 1024, 128))
+        capacities = sorted({*capacities, *(size for size in steps if size < chunk_size)})
     return (*capacities, chunk_size)
 
 
